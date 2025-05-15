@@ -10,6 +10,7 @@ assets/
 *.pptx
 *.log
 preprocessed_debug.png
+compare.py
 
 
 

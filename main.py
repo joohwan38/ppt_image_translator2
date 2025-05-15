@@ -200,7 +200,8 @@ class Application(tk.Frame):
         self.file_name_label = ttk.Label(file_info_frame, text="파일 이름: "); self.file_name_label.pack(anchor=tk.W, pady=1)
         self.slide_count_label = ttk.Label(file_info_frame, text="슬라이드 수: "); self.slide_count_label.pack(anchor=tk.W, pady=1)
         self.text_elements_label = ttk.Label(file_info_frame, text="텍스트 요소 수: "); self.text_elements_label.pack(anchor=tk.W, pady=1)
-        self.image_elements_label = ttk.Label(file_info_frame, text="이미지 내 텍스트 수: "); self.image_elements_label.pack(anchor=tk.W, pady=1)
+        # '이미지 내 텍스트 수' 레이블의 텍스트를 '총 이미지 수'로 변경
+        self.image_elements_label = ttk.Label(file_info_frame, text="총 이미지 수: "); self.image_elements_label.pack(anchor=tk.W, pady=1)
         self.total_elements_label = ttk.Label(file_info_frame, text="총 번역 요소 수: "); self.total_elements_label.pack(anchor=tk.W, pady=1)
         progress_info_frame = ttk.LabelFrame(file_progress_outer_frame, text="진행 상황", padding=5); progress_info_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self.current_slide_label = ttk.Label(progress_info_frame, text="현재 슬라이드: -"); self.current_slide_label.pack(anchor=tk.W, pady=1)
@@ -308,17 +309,39 @@ class Application(tk.Frame):
             self.open_folder_button.config(state=tk.DISABLED)
 
     def load_file_info(self, file_path):
+        # 기본값 설정 (image_elements_with_text는 get_file_info에서 0으로 반환됨)
         info = {"slide_count": 0, "text_elements": 0, "image_elements": 0, "image_elements_with_text": 0}
-        if not self.ocr_handler: logger.warning("OCR 핸들러 미준비. 이미지 내 텍스트는 '0'으로 표시됩니다.")
+        
         try:
-            logger.debug(f"파일 정보 분석 중: {file_path}"); file_name = os.path.basename(file_path)
-            info = self.pptx_handler.get_file_info(file_path, self.ocr_handler) # ocr_handler 전달
-            self.file_name_label.config(text=f"파일 이름: {file_name}"); self.slide_count_label.config(text=f"슬라이드 수: {info.get('slide_count',0)}")
-            self.text_elements_label.config(text=f"텍스트 요소 수: {info.get('text_elements',0)}"); self.image_elements_label.config(text=f"이미지 내 텍스트 수: {info.get('image_elements_with_text',0)}")
-            total_elements = info.get('text_elements',0) + info.get('image_elements_with_text',0)
-            self.total_elements_label.config(text=f"총 번역 요소 수: {total_elements}"); self.remaining_elements_label.config(text=f"남은 요소: {total_elements}")
-            logger.info("파일 정보 분석 완료.")
-        except Exception as e: logger.error(f"파일 정보 분석 오류: {e}", exc_info=True)
+            logger.debug(f"파일 정보 분석 중 (OCR 미수행): {file_path}"); file_name = os.path.basename(file_path)
+            # pptx_handler.get_file_info는 이제 ocr_handler를 내부적으로 사용하지 않음 (카운팅 목적에서)
+            info = self.pptx_handler.get_file_info(file_path, self.ocr_handler) 
+            
+            text_elements_count = info.get('text_elements',0)
+            image_elements_count = info.get('image_elements',0) # 총 이미지 수
+
+            self.file_name_label.config(text=f"파일 이름: {file_name}")
+            self.slide_count_label.config(text=f"슬라이드 수: {info.get('slide_count',0)}")
+            self.text_elements_label.config(text=f"텍스트 요소 수: {text_elements_count}")
+            
+            # self.image_elements_label은 이제 "총 이미지 수"를 표시 (create_widgets에서 텍스트 변경됨)
+            self.image_elements_label.config(text=f"총 이미지 수: {image_elements_count}")
+            
+            # 총 번역 요소 수는 텍스트 요소와 모든 이미지 요소의 합으로 표시 (이미지는 OCR 시도 대상이 됨)
+            total_elements_for_display = text_elements_count + image_elements_count
+            self.total_elements_label.config(text=f"총 번역 요소 수: {total_elements_for_display}")
+            self.remaining_elements_label.config(text=f"남은 요소: {total_elements_for_display}") # 초기 상태
+
+            logger.info("파일 정보 분석 완료 (OCR 카운팅 미수행).")
+        except Exception as e: 
+            logger.error(f"파일 정보 분석 오류: {e}", exc_info=True)
+            # 오류 발생 시 레이블 초기화 또는 오류 메시지 표시도 고려 가능
+            self.file_name_label.config(text="파일 이름: 분석 오류")
+            self.slide_count_label.config(text="슬라이드 수: -")
+            self.text_elements_label.config(text="텍스트 요소 수: -")
+            self.image_elements_label.config(text="총 이미지 수: -")
+            self.total_elements_label.config(text="총 번역 요소 수: -")
+            self.remaining_elements_label.config(text="남은 요소: -")
 
     def check_ollama_status_manual(self, initial_check=False):
         logger.info("Ollama 상태 확인 중...")
