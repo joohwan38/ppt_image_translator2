@@ -13,26 +13,78 @@ import hashlib
 
 logger = logging.getLogger(__name__)
 
+# OCR 텍스트 유효성 검사를 위한 설정 (이전과 동일)
 MIN_OCR_TEXT_LENGTH_TO_VALIDATE = 2
-MIN_MEANINGFUL_CHAR_RATIO = 0.4
+MIN_MEANINGFUL_CHAR_RATIO = 0.4 # 의미 있는 문자 비율 임계값
 MAX_CONSECUTIVE_STRANGE_SPECIAL_CHARS = 3
 
-def is_ocr_text_valid(text: str) -> bool:
-    # (이전 안정화 시점의 유효성 검사 로직)
+# --- 번역 스킵 조건 함수 ---
+def should_skip_translation(text: str) -> bool:
+    """주어진 텍스트가 번역할 가치가 없는지(숫자, 특수문자, 깨진 문자 등) 확인합니다."""
+    if not text or not text.strip():
+        return True # 비었거나 공백만 있으면 스킵
+
+    # 1. 의미 있는 문자(알파벳, 한글, 일본어, 한자 등)가 전혀 없는지 확인
+    # 정규식: 최소 하나의 한글, 일본어(히라가나/가타카나/한자), 또는 알파벳 문자를 포함하는지
+    # \w 는 숫자도 포함하므로, 여기서는 명시적으로 문자 범위를 지정
+    meaningful_char_pattern = re.compile(r'[a-zA-Z\u3040-\u30ff\u3131-\uD79D\u4e00-\u9fff]') # 영어 알파벳, 일본어, 한글, 한자
+    if not meaningful_char_pattern.search(text):
+        logger.info(f"번역 스킵 (의미 있는 문자 없음): '{text}'")
+        return True
+
+    # 2. 숫자, 일반적인 특수문자(구두점 등), 공백으로만 구성되어 있는지 확인
+    # 숫자, 정의된 특수문자, 공백 외의 문자가 있다면 번역 대상이 될 수 있음.
+    # 여기서는 "의미 있는 문자"가 위에서 하나라도 발견되었다면,
+    # 이 조건은 덜 엄격하게 적용하거나, 특정 패턴(예: 단순 날짜 "2024-05-15")을 추가로 제외할 수 있음.
+    # 현재는 위 meaningful_char_pattern으로 1차 필터링 후, 아래 조건은 좀 더 관대하게.
+
+    # 추가적으로, 전체 문자열에서 의미있는 문자 비율이 너무 낮은 경우도 스킵 (is_ocr_text_valid 와 유사)
+    stripped_text = text.strip()
+    text_len = len(stripped_text)
+    if text_len == 0: return True # 이미 위에서 처리됨
+
+    meaningful_chars_count = 0
+    for char_obj in stripped_text: # char -> char_obj로 변경 (의미 명확화)
+        if meaningful_char_pattern.search(char_obj):
+            meaningful_chars_count += 1
+    
+    # 의미 있는 문자가 하나도 없으면 위에서 이미 걸러졌으므로, 여기서는 비율만 체크
+    if text_len > 0 and (meaningful_chars_count / text_len) < MIN_MEANINGFUL_CHAR_RATIO:
+        # 단, 아주 짧은 문자열(예: 2~3글자)은 이 비율만으로 판단하기 어려울 수 있음.
+        # 여기서는 is_ocr_text_valid에서 사용한 MIN_OCR_TEXT_LENGTH_TO_VALIDATE 보다 긴 경우에만 엄격히 적용
+        if text_len > MAX_CONSECUTIVE_STRANGE_SPECIAL_CHARS + 2: # 임의의 길이 (예: 5글자 이상)
+            logger.info(f"번역 스킵 (의미 있는 문자 비율 낮음 {meaningful_chars_count / text_len:.2f}): '{text}'")
+            return True
+            
+    # 예시: 숫자와 특정 특수문자로만 이루어진 경우 (더 정교한 패턴 필요 가능)
+    # ^[\d\s.,;:?!()\[\]{}'"‘’“”%+-=*\/\\<>@#$&^|_~]+$  <-- 이 패턴은 너무 많은 것을 스킵할 수 있음
+    # 여기서는 meaningful_char_pattern에 걸리지 않으면 위에서 스킵되므로, 이 부분은 생략하거나 매우 제한적으로.
+
+    return False # 위 조건에 해당하지 않으면 번역 대상
+
+def is_ocr_text_valid(text: str) -> bool: # 이 함수는 OCR 결과 자체의 유효성 검사용
+    # (이전과 동일하게 유지 - 번역 가치와는 별개로 OCR 인식 결과가 쓰레기값인지 판단)
     stripped_text = text.strip();
     if not stripped_text: return False
     text_len = len(stripped_text)
     if text_len < MIN_OCR_TEXT_LENGTH_TO_VALIDATE:
         if re.search(r'[\w\u3040-\u30ff\u3131-\uD79D\u4e00-\u9fff]', stripped_text) or re.fullmatch(r"""[.,;:?!()\[\]{}'"‘’“”]""", stripped_text): return True
-        else: logger.info(f"OCR 스킵 (짧고 유효문자X): '{stripped_text}'"); return False
-    meaningful_chars_count = 0; meaningful_pattern = re.compile(r"""[\w\u3040-\u30ff\u3131-\uD79D\u4e00-\u9fff\s.,;:?!()\[\]{}'"‘’“”]""")
-    for char in stripped_text:
-        if meaningful_pattern.search(char): meaningful_chars_count += 1
-    if text_len == 0: return False
-    ratio = meaningful_chars_count / text_len
-    if ratio < MIN_MEANINGFUL_CHAR_RATIO: logger.info(f"OCR 스킵 (의미문자 비율 낮음 {ratio:.2f}): '{stripped_text}'"); return False
+        else: logger.info(f"OCR 유효성 스킵 (짧고 유효문자X): '{stripped_text}'"); return False
+    
+    meaningful_char_pattern = re.compile(r'[a-zA-Z\u3040-\u30ff\u3131-\uD79D\u4e00-\u9fff]')
+    meaningful_chars_count = 0
+    for char_obj in stripped_text:
+        if meaningful_char_pattern.search(char_obj): # \w 대신 명시적 문자 사용
+            meaningful_chars_count += 1
+
+    if text_len > 0 and (meaningful_chars_count / text_len) < MIN_MEANINGFUL_CHAR_RATIO:
+        logger.info(f"OCR 유효성 스킵 (의미문자 비율 낮음 {meaningful_chars_count / text_len:.2f}): '{stripped_text}'")
+        return False
+        
     strange_pattern = f"(?:[^\w\s\u3040-\u30ff\u3131-\uD79D\u4e00-\u9fff.,;:?!()\[\]{{}}'\"‘’“”]){{{MAX_CONSECUTIVE_STRANGE_SPECIAL_CHARS},}}"
-    if re.search(strange_pattern, stripped_text): logger.info(f"OCR 스킵 (이상한 특수문자 연속): '{stripped_text}'"); return False
+    if re.search(strange_pattern, stripped_text):
+        logger.info(f"OCR 유효성 스킵 (이상한 특수문자 연속): '{stripped_text}'")
+        return False
     return True
 
 class PptxHandler:
