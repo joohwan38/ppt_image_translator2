@@ -66,12 +66,12 @@ DEFAULT_MODEL = "gemma3:12b" # 사용자님 요청으로 gemma3:12b 로 변경
 SUPPORTED_LANGUAGES = ["한국어", "일본어", "영어", "중국어", "대만어", "태국어", "스페인어"]
 UI_LANG_TO_PADDLEOCR_CODE = {
     "한국어": "korean", "일본어": "japan", "영어": "en",
-    "중국어": "ch", "대만어": "chinese_cht", "태국어": "th", "스페인어": "es",
+    "중국어": "ch_doc", "대만어": "chinese_cht", "태국어": "th", "스페인어": "es",
 }
 DEFAULT_PADDLE_OCR_LANG = "korean"
 UI_LANG_TO_FONT_CODE_MAP = {
     "한국어": "korean", "일본어": "japan", "영어": "en",
-    "중국어": "ch", "대만어": "chinese_cht", "태국어": "th", "스페인어": "es",
+    "중국어": "ch_doc", "대만어": "chinese_cht", "태국어": "th", "스페인어": "es",
 }
 TRANSLATION_HISTORY = []
 

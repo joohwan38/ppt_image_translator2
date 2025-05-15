@@ -17,6 +17,7 @@ MIN_OCR_TEXT_LENGTH_TO_VALIDATE = 2
 MIN_MEANINGFUL_CHAR_RATIO = 0.4
 MAX_CONSECUTIVE_STRANGE_SPECIAL_CHARS = 3
 
+<<<<<<< HEAD
 def should_skip_translation(text: str) -> bool:
     if not text or not text.strip(): return True
     meaningful_char_pattern = re.compile(r'[a-zA-Z\uAC00-\uD7AF\u3040-\u30FF\u4E00-\u9FFF]')
@@ -33,11 +34,16 @@ def should_skip_translation(text: str) -> bool:
 
 def is_ocr_text_valid(text: str) -> bool: # OCR 결과 자체의 유효성
     # (이전 복구된 버전과 동일)
+=======
+def is_ocr_text_valid(text: str) -> bool:
+    # (이전 안정화 시점의 유효성 검사 로직)
+>>>>>>> parent of f6960ee (초기커밋)
     stripped_text = text.strip();
     if not stripped_text: return False
     text_len = len(stripped_text)
     meaningful_char_pattern_ocr = re.compile(r'[a-zA-Z\uAC00-\uD7AF\u3040-\u30FF\u4E00-\u9FFF]')
     if text_len < MIN_OCR_TEXT_LENGTH_TO_VALIDATE:
+<<<<<<< HEAD
         return bool(meaningful_char_pattern_ocr.search(stripped_text) or re.fullmatch(r"""[.,;:?!()\[\]{}'"‘’“”]""", stripped_text))
     meaningful_chars_count = sum(1 for char_obj in stripped_text if meaningful_char_pattern_ocr.search(char_obj))
     if text_len > 0 and (meaningful_chars_count / text_len) < MIN_MEANINGFUL_CHAR_RATIO:
@@ -45,6 +51,18 @@ def is_ocr_text_valid(text: str) -> bool: # OCR 결과 자체의 유효성
     strange_pattern = f"(?:[^\w\s\uAC00-\uD7AF\u3040-\u30FF\u4E00-\u9FFF.,;:?!()\[\]{{}}'\"‘’“”]){{{MAX_CONSECUTIVE_STRANGE_SPECIAL_CHARS},}}"
     if re.search(strange_pattern, stripped_text):
         logger.info(f"OCR 유효성 스킵 (이상한 특수문자 연속): '{stripped_text}'"); return False
+=======
+        if re.search(r'[\w\u3040-\u30ff\u3131-\uD79D\u4e00-\u9fff]', stripped_text) or re.fullmatch(r"""[.,;:?!()\[\]{}'"‘’“”]""", stripped_text): return True
+        else: logger.info(f"OCR 스킵 (짧고 유효문자X): '{stripped_text}'"); return False
+    meaningful_chars_count = 0; meaningful_pattern = re.compile(r"""[\w\u3040-\u30ff\u3131-\uD79D\u4e00-\u9fff\s.,;:?!()\[\]{}'"‘’“”]""")
+    for char in stripped_text:
+        if meaningful_pattern.search(char): meaningful_chars_count += 1
+    if text_len == 0: return False
+    ratio = meaningful_chars_count / text_len
+    if ratio < MIN_MEANINGFUL_CHAR_RATIO: logger.info(f"OCR 스킵 (의미문자 비율 낮음 {ratio:.2f}): '{stripped_text}'"); return False
+    strange_pattern = f"(?:[^\w\s\u3040-\u30ff\u3131-\uD79D\u4e00-\u9fff.,;:?!()\[\]{{}}'\"‘’“”]){{{MAX_CONSECUTIVE_STRANGE_SPECIAL_CHARS},}}"
+    if re.search(strange_pattern, stripped_text): logger.info(f"OCR 스킵 (이상한 특수문자 연속): '{stripped_text}'"); return False
+>>>>>>> parent of f6960ee (초기커밋)
     return True
 
 class PptxHandler:
