@@ -5,7 +5,7 @@ build/
 dist/
 wheels/
 logs/
-assets/
+# assets/
 *.egg-info
 *.pptx
 *.log
