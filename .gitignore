@@ -9,6 +9,7 @@ assets/
 *.egg-info
 *.pptx
 *.log
+preprocessed_debug.png
 
 
 
