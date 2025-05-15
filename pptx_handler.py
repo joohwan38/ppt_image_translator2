@@ -19,7 +19,21 @@ logger = logging.getLogger(__name__)
 # (should_skip_translation, is_ocr_text_valid, get_file_info, _get_text_style, _apply_text_style 함수는 이전 답변과 동일하게 유지)
 MIN_MEANINGFUL_CHAR_RATIO_SKIP = 0.1
 MIN_MEANINGFUL_CHAR_RATIO_OCR = 0.1
-MEANINGFUL_CHAR_PATTERN = re.compile(r'[a-zA-Z\u3040-\u30ff\u3131-\uD79D\u4e00-\u9fff]')
+MEANINGFUL_CHAR_PATTERN = re.compile(
+    r'[a-zA-Z'                 # 영어
+    r'\u00C0-\u024F'           # 베트남어 포함한 Latin Extended-A, B 일부
+    r'\u1E00-\u1EFF'           # Latin Extended Additional (베트남어 악센트 등)
+    r'\u0600-\u06FF'           # 아랍어 기본
+    r'\u0750-\u077F'           # 아랍어 보충
+    r'\u08A0-\u08FF'           # 아랍어 확장-A
+    r'\u3040-\u30ff'           # 일본어
+    r'\u3131-\uD79D'           # 한글
+    r'\u4e00-\u9fff'           # 한자
+    r'\u0E00-\u0E7F'           # 태국어
+    r']'
+)
+
+
 
 def should_skip_translation(text: str) -> bool:
     if not text: return True
