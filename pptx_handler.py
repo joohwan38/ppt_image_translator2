@@ -487,7 +487,23 @@ class PptxHandler:
                                                 with Image.open(image_bytes_io) as edited_image_pil_base:
                                                     edited_image_pil = edited_image_pil_base.copy()
                                                     any_ocr_text_translated_and_rendered = False
-                                                    for ocr_idx, (box, (text, confidence)) in enumerate(ocr_results):
+                                                    for ocr_idx, ocr_item in enumerate(ocr_results):
+                                                        if not (isinstance(ocr_item, (list, tuple)) and len(ocr_item) >= 2): # 최소 2개 요소 확인
+                                                            logger.warning(f"      잘못된 OCR 결과 항목 형식: {ocr_item}. 건너뜀.")
+                                                            f_task_log.write(f"        잘못된 OCR 결과 항목 형식. 건너뜀.\n")
+                                                            continue
+
+                                                        box = ocr_item[0]
+                                                        text_confidence_tuple = ocr_item[1]
+                                                        ocr_angle = ocr_item[2] if len(ocr_item) > 2 else None # 각도 정보 (선택적)
+
+                                                        if not (isinstance(text_confidence_tuple, (list, tuple)) and len(text_confidence_tuple) == 2):
+                                                            logger.warning(f"      잘못된 OCR 텍스트/신뢰도 튜플 형식: {text_confidence_tuple}. 건너뜀.")
+                                                            f_task_log.write(f"        잘못된 OCR 텍스트/신뢰도 튜플 형식. 건너뜀.\n")
+                                                            continue
+                                                        
+                                                        text, confidence = text_confidence_tuple
+                                                        # 이제 box, text, confidence, ocr_angle 변수 사용 가능
                                                         if stop_event and stop_event.is_set(): break
                                                         current_text_for_progress = text
                                                         log_ocr_text = text.replace(chr(10), ' ').strip()[:50]
