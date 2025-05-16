@@ -19,5 +19,6 @@ dependencies = [
 
 [dependency-groups]
 dev = [
+    "flake8>=7.2.0",
     "huggingface-hub>=0.31.2",
 ]
