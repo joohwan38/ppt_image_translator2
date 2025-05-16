@@ -2,256 +2,185 @@ import zipfile
 import xml.etree.ElementTree as ET
 import os
 import re
+import requests
+import tempfile
+import shutil
+from pathlib import Path
 
-def extract_chart_text(pptx_path):
-    print(f"Analyzing file: {os.path.basename(pptx_path)}")
+def translate_text(text, target_lang="en"):
+    """Ollama API를 사용하여 텍스트 번역"""
+    if not text or not text.strip():
+        return text
     
-    # PPTX 파일을 ZIP으로 열기
-    with zipfile.ZipFile(pptx_path, 'r') as zip_ref:
-        # 필요한 네임스페이스 정의
-        namespaces = {
-            'a': 'http://schemas.openxmlformats.org/drawingml/2006/main',
-            'c': 'http://schemas.openxmlformats.org/drawingml/2006/chart',
-            'r': 'http://schemas.openxmlformats.org/officeDocument/2006/relationships',
-            'p': 'http://schemas.openxmlformats.org/presentationml/2006/main'
-        }
+    # Ollama API 엔드포인트
+    url = "http://localhost:11434/api/generate"
+    
+    # 번역 프롬프트 작성
+    prompt = f"Translate the following text to {target_lang}. Return only the translation without explanations: \"{text}\""
+    
+    # API 요청 데이터
+    data = {
+        "model": "gemma3:12b",
+        "prompt": prompt,
+        "stream": False
+    }
+    
+    try:
+        # API 호출
+        response = requests.post(url, json=data)
+        response.raise_for_status()
+        result = response.json()
         
-        # 슬라이드 목록 찾기
-        slides = sorted([f for f in zip_ref.namelist() if f.startswith('ppt/slides/slide') and f.endswith('.xml')])
-        slide_count = 0
-        chart_count = 0
+        # 결과에서 번역된 텍스트 추출
+        translated_text = result.get("response", "").strip()
         
-        # 각 슬라이드 분석
-        for slide_path in slides:
-            slide_count += 1
-            slide_num = re.search(r'slide(\d+)\.xml', slide_path).group(1)
-            print(f"\nSlide {slide_num}:")
-            
-            # 슬라이드 파일 열기
-            with zip_ref.open(slide_path) as f:
-                slide_tree = ET.parse(f)
-                slide_root = slide_tree.getroot()
-                
-                # 슬라이드의 관계 파일 경로
-                slide_rel_path = f'ppt/slides/_rels/slide{slide_num}.xml.rels'
-                
-                if slide_rel_path in zip_ref.namelist():
-                    # 관계 파일 열기
-                    with zip_ref.open(slide_rel_path) as rel_file:
-                        rel_tree = ET.parse(rel_file)
-                        rel_root = rel_tree.getroot()
-                        
-                        # 차트 관계 찾기
-                        chart_rels = {}
-                        for rel in rel_root.findall('.//{*}Relationship'):
-                            if 'Type' in rel.attrib and 'chart' in rel.attrib['Type']:
-                                chart_rels[rel.attrib['Id']] = rel.attrib['Target']
-                        
-                        # 슬라이드에서 차트 찾기
-                        chart_refs = slide_root.findall('.//p:graphicFrame//c:chart', namespaces)
-                        
-                        if not chart_refs:
-                            print("  No charts in this slide.")
-                            continue
-                        
-                        for chart_ref in chart_refs:
-                            chart_count += 1
-                            
-                            # 차트 ID 가져오기 (r:id 속성)
-                            chart_rid = None
-                            for attrib_name in chart_ref.attrib:
-                                if attrib_name.endswith('id'):
-                                    chart_rid = chart_ref.attrib[attrib_name]
-                                    break
-                            
-                            if chart_rid and chart_rid in chart_rels:
-                                # 차트 파일 경로 생성
-                                chart_target = chart_rels[chart_rid]
-                                
-                                # 상대 경로를 절대 경로로 변환
-                                if chart_target.startswith('../'):
-                                    chart_path = 'ppt/' + chart_target[3:]
-                                else:
-                                    chart_path = os.path.dirname(slide_path) + '/' + chart_target
-                                
-                                print(f"  Chart {chart_count} found! (Path: {chart_path})")
-                                
-                                # 차트 파일이 존재하는지 확인
-                                if chart_path in zip_ref.namelist():
-                                    # 차트 XML 파일 분석
-                                    with zip_ref.open(chart_path) as chart_file:
-                                        chart_tree = ET.parse(chart_file)
-                                        chart_root = chart_tree.getroot()
-                                        
-                                        # 1. 차트 제목 (다양한 방식으로 시도)
-                                        title_text = None
-                                        
-                                        # 표준 차트 제목
-                                        title_elements = chart_root.findall('.//c:title//a:t', namespaces)
-                                        if title_elements:
-                                            for title in title_elements:
-                                                if title.text:
-                                                    title_text = title.text
-                                                    break
-                                        
-                                        # 대체 방법: 텍스트 상자로 된 제목
-                                        if not title_text:
-                                            alt_title = chart_root.find('.//c:chart//c:title', namespaces)
-                                            if alt_title is not None:
-                                                tx_elements = alt_title.findall('.//a:t', namespaces)
-                                                for tx in tx_elements:
-                                                    if tx.text:
-                                                        title_text = tx.text
-                                                        break
-                                        
-                                        # 차트 요소 외부에 있는 제목 (슬라이드 내 텍스트)
-                                        if not title_text:
-                                            chart_parent = None
-                                            for elem in slide_root.findall('.//p:graphicFrame', namespaces):
-                                                for c in elem.findall('.//c:chart', namespaces):
-                                                    for attr in c.attrib:
-                                                        if attr.endswith('id') and c.attrib[attr] == chart_rid:
-                                                            chart_parent = elem
-                                                            break
-                                            
-                                            if chart_parent:
-                                                # 차트 위에 있는 텍스트 상자 찾기
-                                                for shape in slide_root.findall('.//p:sp', namespaces):
-                                                    txBody = shape.find('.//p:txBody', namespaces)
-                                                    if txBody:
-                                                        text_elems = txBody.findall('.//a:t', namespaces)
-                                                        for t in text_elems:
-                                                            if t.text and len(t.text.strip()) > 0:
-                                                                title_text = t.text
-                                                                break
-                                        
-                                        # 가능한 모든 방법으로 제목을 찾았으면 출력
-                                        if title_text:
-                                            print(f"  • Chart Title: {title_text}")
-                                        
-                                        # 2. 범례(시리즈 이름) - 개선된 방법
-                                        # 시리즈 레이블을 저장할 집합(중복 방지)
-                                        series_names = set()
-                                        
-                                        # 방법 1: 시리즈 텍스트에서 직접 찾기
-                                        for ser in chart_root.findall('.//c:ser', namespaces):
-                                            tx = ser.find('.//c:tx', namespaces)
-                                            if tx is not None:
-                                                # 방법 1-1: 직접 텍스트
-                                                v = tx.find('.//c:v', namespaces)
-                                                if v is not None and v.text:
-                                                    series_names.add(v.text)
-                                                    continue
-                                                
-                                                # 방법 1-2: 참조 문자열
-                                                strRef = tx.find('.//c:strRef', namespaces)
-                                                if strRef is not None:
-                                                    pt = strRef.find('.//c:pt//c:v', namespaces)
-                                                    if pt is not None and pt.text:
-                                                        series_names.add(pt.text)
-                                                        continue
-                                                
-                                                # 방법 1-3: 서식 있는 텍스트
-                                                rich = tx.find('.//a:rich', namespaces)
-                                                if rich is not None:
-                                                    t = rich.find('.//a:t', namespaces)
-                                                    if t is not None and t.text:
-                                                        series_names.add(t.text)
-                                        
-                                        # 방법 2: 범례 요소에서 찾기
-                                        legend = chart_root.find('.//c:legend', namespaces)
-                                        if legend is not None:
-                                            txPrs = legend.findall('.//a:t', namespaces)
-                                            for t in txPrs:
-                                                if t.text:
-                                                    series_names.add(t.text)
-                                        
-                                        # 결과 출력
-                                        if series_names:
-                                            print("  • Series Names (Legend):")
-                                            for i, name in enumerate(series_names, 1):
-                                                print(f"    - Series {i}: {name}")
-                                        
-                                        # 3. 축 제목 (더 다양한 방법으로 시도)
-                                        axes = chart_root.findall('.//c:axis', namespaces)
-                                        for axis in axes:
-                                            axis_id = axis.find('.//c:axId', namespaces)
-                                            axis_type = ""
-                                            if axis_id is not None:
-                                                axis_type = "X-axis" if axis.get('{http://schemas.openxmlformats.org/drawingml/2006/chart}axId') == "1" else "Y-axis"
-                                            
-                                            # 축 제목 요소 찾기
-                                            title = axis.find('.//c:title', namespaces)
-                                            if title is not None:
-                                                # 다양한 방법으로 텍스트 추출 시도
-                                                axis_title_text = None
-                                                
-                                                # 방법 1: 직접 텍스트
-                                                for t in title.findall('.//a:t', namespaces):
-                                                    if t.text:
-                                                        axis_title_text = t.text
-                                                        break
-                                                
-                                                # 방법 2: 참조 문자열
-                                                if not axis_title_text:
-                                                    strRef = title.find('.//c:strRef//c:strCache//c:pt//c:v', namespaces)
-                                                    if strRef is not None and strRef.text:
-                                                        axis_title_text = strRef.text
-                                                
-                                                if axis_title_text:
-                                                    print(f"  • {axis_type} Title: {axis_title_text}")
-                                        
-                                        # 4. 카테고리 레이블 (중복 제거)
-                                        # X축 카테고리를 저장할 리스트 (순서 유지)
-                                        categories = []
-                                        category_set = set()  # 중복 확인용
-                                        
-                                        # 방법 1: 일반적인 카테고리 (문자열)
-                                        for cat in chart_root.findall('.//c:cat//c:strRef//c:strCache//c:pt', namespaces):
-                                            idx = cat.get('idx')
-                                            v = cat.find('.//c:v', namespaces)
-                                            if v is not None and v.text and v.text not in category_set:
-                                                categories.append((int(idx) if idx else len(categories), v.text))
-                                                category_set.add(v.text)
-                                        
-                                        # 방법 2: 숫자 카테고리
-                                        if not categories:
-                                            for cat in chart_root.findall('.//c:cat//c:numRef//c:numCache//c:pt', namespaces):
-                                                idx = cat.get('idx')
-                                                v = cat.find('.//c:v', namespaces)
-                                                if v is not None and v.text and v.text not in category_set:
-                                                    categories.append((int(idx) if idx else len(categories), v.text))
-                                                    category_set.add(v.text)
-                                        
-                                        # 순서대로 정렬하고 출력
-                                        if categories:
-                                            categories.sort(key=lambda x: x[0])
-                                            print("  • Category Labels (X-axis):")
-                                            for i, (_, cat) in enumerate(categories, 1):
-                                                print(f"    - Category {i}: {cat}")
-                                        
-                                        # 5. 데이터 레이블
-                                        data_labels = set()
-                                        for label in chart_root.findall('.//c:dLbls//a:t', namespaces):
-                                            if label.text:
-                                                data_labels.add(label.text)
-                                        
-                                        if data_labels:
-                                            print("  • Data Labels:")
-                                            for i, label in enumerate(data_labels, 1):
-                                                print(f"    - Label {i}: {label}")
-                                else:
-                                    print(f"  Error: Chart file not found ({chart_path})")
-                                
-                                print("-" * 50)
-                else:
-                    print("  No relationships file found for this slide.")
+        # 따옴표 제거 (API 응답에 따옴표가 포함될 수 있음)
+        if translated_text.startswith('"') and translated_text.endswith('"'):
+            translated_text = translated_text[1:-1]
         
-        if chart_count == 0:
-            print("\nNo charts found in the presentation.")
-        else:
-            print(f"\nTotal: {chart_count} charts found in {slide_count} slides.")
+        print(f"  - 번역: '{text}' -> '{translated_text}'")
+        return translated_text
+    except Exception as e:
+        print(f"  - 번역 오류: {e}")
+        return text  # 오류 시 원본 반환
 
-# 요청하신 대로 수정된 부분
+def translate_pptx_charts(pptx_path, target_lang="en", output_path=None):
+    """PowerPoint 파일의 차트 텍스트를 추출하고 번역한 후 다시 삽입"""
+    if output_path is None:
+        # 출력 파일 경로 생성 (원본_translated.pptx)
+        base_name = os.path.splitext(pptx_path)[0]
+        output_path = f"{base_name}_translated.pptx"
+    
+    print(f"PowerPoint 차트 번역 시작: {os.path.basename(pptx_path)} -> {os.path.basename(output_path)}")
+    print(f"대상 언어: {target_lang}")
+    
+    # 임시 디렉토리 생성
+    temp_dir = tempfile.mkdtemp()
+    chart_dir = os.path.join(temp_dir, "charts")
+    os.makedirs(chart_dir, exist_ok=True)
+    
+    try:
+        # 차트 파일 분석 및 번역
+        with zipfile.ZipFile(pptx_path, 'r') as zip_ref:
+            # 네임스페이스 정의
+            namespaces = {
+                'a': 'http://schemas.openxmlformats.org/drawingml/2006/main',
+                'c': 'http://schemas.openxmlformats.org/drawingml/2006/chart',
+                'r': 'http://schemas.openxmlformats.org/officeDocument/2006/relationships',
+                'p': 'http://schemas.openxmlformats.org/presentationml/2006/main'
+            }
+            
+            # 차트 XML 파일 목록 찾기
+            chart_files = [f for f in zip_ref.namelist() if f.startswith('ppt/charts/') and f.endswith('.xml')]
+            print(f"총 {len(chart_files)}개의 차트 파일을 발견했습니다.")
+            
+            # 차트 파일 저장 - 수정할 파일 목록
+            modified_charts = set()
+            
+            # 각 차트 파일 처리
+            for chart_path in chart_files:
+                print(f"\n처리 중: {chart_path}")
+                
+                # 차트 XML 파일 내용 읽기
+                with zip_ref.open(chart_path) as f:
+                    content = f.read()
+                    # XML 파싱 전에 선언 저장
+                    xml_declaration = b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                    if content.startswith(b'<?xml'):
+                        xml_end = content.find(b'?>')
+                        if xml_end > 0:
+                            xml_declaration = content[:xml_end+2]
+                    
+                    tree = ET.ElementTree(ET.fromstring(content))
+                    root = tree.getroot()
+                
+                # 1. 차트 제목 번역
+                title_elements = root.findall('.//c:title//a:t', namespaces)
+                for elem in title_elements:
+                    if elem.text and elem.text.strip():
+                        elem.text = translate_text(elem.text.strip(), target_lang)
+                
+                # 참조 텍스트로 저장된 제목
+                title_elem = root.find('.//c:chart/c:title', namespaces)
+                if title_elem is not None:
+                    for v in title_elem.findall('.//c:v', namespaces):
+                        if v.text and v.text.strip():
+                            v.text = translate_text(v.text.strip(), target_lang)
+                
+                # 2. 시리즈 이름(범례) 번역
+                for ser in root.findall('.//c:ser', namespaces):
+                    tx = ser.find('.//c:tx', namespaces)
+                    if tx is not None:
+                        # 직접 값
+                        v = tx.find('.//c:v', namespaces)
+                        if v is not None and v.text:
+                            v.text = translate_text(v.text, target_lang)
+                        
+                        # 참조 값
+                        for v in tx.findall('.//c:strRef//c:strCache//c:pt//c:v', namespaces):
+                            if v.text:
+                                v.text = translate_text(v.text, target_lang)
+                
+                # 3. 카테고리 레이블(X축) 번역
+                for cat in root.findall('.//c:cat//c:strRef//c:strCache//c:pt//c:v', namespaces):
+                    if cat.text:
+                        cat.text = translate_text(cat.text, target_lang)
+                
+                # 4. 축 제목 번역
+                for axis in root.findall('.//c:axis', namespaces):
+                    title = axis.find('.//c:title', namespaces)
+                    if title is not None:
+                        for t in title.findall('.//a:t', namespaces):
+                            if t.text:
+                                t.text = translate_text(t.text, target_lang)
+                        
+                        for v in title.findall('.//c:v', namespaces):
+                            if v.text:
+                                v.text = translate_text(v.text, target_lang)
+                
+                # 5. 데이터 레이블 번역
+                for label in root.findall('.//c:dLbls//a:t', namespaces):
+                    if label.text:
+                        label.text = translate_text(label.text, target_lang)
+                
+                # 수정된 XML 문자열 생성 (원본 XML 선언 유지)
+                xml_string = ET.tostring(root, encoding='UTF-8')
+                
+                # 원본 선언 추가
+                final_xml = xml_declaration + b'\n' + xml_string
+                
+                # 수정된 차트 파일 저장
+                temp_file = os.path.join(chart_dir, os.path.basename(chart_path))
+                with open(temp_file, 'wb') as f:
+                    f.write(final_xml)
+                
+                # 수정된 파일 목록에 추가
+                modified_charts.add(chart_path)
+            
+            # 모든 파일 목록 (수정된 차트 파일 제외)
+            all_files = [f for f in zip_ref.namelist() if f not in modified_charts]
+            
+            # 새 PPTX 파일 생성
+            with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED) as zip_out:
+                # 1. 수정되지 않은 파일 복사
+                for file_path in all_files:
+                    zip_out.writestr(file_path, zip_ref.read(file_path))
+                
+                # 2. 수정된 차트 파일 추가
+                for chart_path in modified_charts:
+                    temp_file = os.path.join(chart_dir, os.path.basename(chart_path))
+                    with open(temp_file, 'rb') as f:
+                        zip_out.writestr(chart_path, f.read())
+        
+        print(f"\n번역 완료! 파일 저장됨: {output_path}")
+    
+    finally:
+        # 임시 디렉토리 정리
+        shutil.rmtree(temp_dir)
+
+# 예시 사용법
 if __name__ == "__main__":
-    extract_chart_text('files/번역테스트1.pptx')
+    # 예시: 파워포인트 파일의 차트를 한국어로 번역
+    input_file = 'files/xml_test.pptx'
+    target_language = 'ja'
+    translate_pptx_charts(input_file, target_language)

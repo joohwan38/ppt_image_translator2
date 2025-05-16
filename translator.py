@@ -64,7 +64,7 @@ class OllamaTranslator:
                     f"Original OCR text ({source_lang_name}):\n{text_to_translate}\n\n"
                     f"Translated text ({target_lang_name}):\n"
                 )
-                temperature_setting = 0.5 # 사용자 요청: OCR 0.5
+                temperature_setting = 0.4 # 사용자 요청: OCR 0.5
             else: # 일반 텍스트
                 prompt = (
                     f"{prompt_instruction}\n"

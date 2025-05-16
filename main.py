@@ -51,7 +51,7 @@ SUPPORTED_LANGUAGES = ["한국어", "일본어", "영어", "중국어", "대만�
 EASYOCR_SUPPORTED_UI_LANGS = ["일본어", "태국어", "스페인어"] # EasyOCR을 우선 사용할 UI 언어 목록
 UI_LANG_TO_PADDLEOCR_CODE_MAP = { # PaddleOCR 공식 지원 언어 코드 기준
     "한국어": "korean", "영어": "en",
-    "중국어": "ch",  # 간체 및 번체 포함 가능성 있음, 또는 'chinese_sim' 등 정확한 코드 사용
+    "중국어": "ch_doc",  # 간체 및 번체 포함 가능성 있음, 또는 'chinese_sim' 등 정확한 코드 사용
     "대만어": "chinese_cht",
     # PaddleOCR도 일본어, 태국어, 스페인어를 지원하지만, 여기서는 EasyOCR 우선 사용 언어에서 제외
 }
@@ -62,7 +62,7 @@ DEFAULT_PADDLE_OCR_LANG = "korean" # PaddleOCR 사용 시 기본 언어
 
 UI_LANG_TO_FONT_CODE_MAP = {
     "한국어": "korean", "일본어": "japan", "영어": "en",
-    "중국어": "ch", "대만어": "chinese_cht", "태국어": "th", "스페인어": "es",
+    "중국어": "ch_doc", "대만어": "chinese_cht", "태국어": "th", "스페인어": "es",
 }
 TRANSLATION_HISTORY = []
 
