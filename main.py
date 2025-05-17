@@ -63,6 +63,8 @@ class Application(tk.Frame):
         self.master.title(APP_NAME)
         self.general_file_handler = None
         self._setup_logging_file_handler()
+        self.ollama_service = OllamaService()
+        self.translator = OllamaTranslator() # OllamaTranslator 인스턴스 생성
 
         app_icon_png_path = os.path.join(ASSETS_DIR, "app_icon.png")
         app_icon_ico_path = os.path.join(ASSETS_DIR, "app_icon.ico")
@@ -634,11 +636,14 @@ class Application(tk.Frame):
 
 
     def load_ollama_models(self):
-        logger.debug("Ollama 모델 목록 로드 중...")
+        logger.debug("Ollama 모델 목록 로드 중 (UI 요청)...")
         self.model_refresh_button.config(state=tk.DISABLED)
         self.master.update_idletasks()
 
-        models = self.ollama_service.get_text_models()
+        # 모델 목록 가져오기 전에 캐시 무효화 (사용자가 새로고침 버튼을 눌렀으므로)
+        self.ollama_service.invalidate_models_cache() 
+        
+        models = self.ollama_service.get_text_models() # 캐시가 적용된 함수 호출
         if models:
             self.model_combo.config(values=models, state="readonly")
             current_selected_model = self.model_var.get()

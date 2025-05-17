@@ -22,6 +22,7 @@ import shutil
 import config
 
 from typing import TYPE_CHECKING, Optional, Dict, Any, List, Tuple, Callable, TypedDict # TypedDict 추가
+from concurrent.futures import ThreadPoolExecutor # 추가
 
 
 if TYPE_CHECKING:
