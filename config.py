@@ -3,26 +3,24 @@ import os
 import logging
 
 # --- Base Directories ---
-# ... (기존과 동일) ...
 PROJECT_ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # --- Application Settings ---
 APP_NAME = "Powerpoint Document Translator"
-DEFAULT_OLLAMA_MODEL = "gemma3:12b" # Ollama 번역 모델
+DEFAULT_OLLAMA_MODEL = "gemma3:12b"
 SUPPORTED_LANGUAGES = ["한국어", "일본어", "영어", "중국어", "대만어", "태국어", "스페인어"]
-USER_SETTINGS_FILENAME = "user_settings.json" # --- 1단계 개선: 사용자 설정 파일 이름 추가 ---
+USER_SETTINGS_FILENAME = "user_settings.json"
 
-# --- Path Settings (PROJECT_ROOT_DIR 기준 상대 경로) ---
-# ... (기존과 동일) ...
+# --- Path Settings ---
 ASSETS_DIR_NAME = "assets"
 FONTS_DIR_NAME = "fonts"
 LOGS_DIR_NAME = "logs"
-HISTORY_DIR_NAME = "hist" # 번역 히스토리 저장 폴더명
+HISTORY_DIR_NAME = "hist"
 
 ASSETS_DIR = os.path.join(PROJECT_ROOT_DIR, ASSETS_DIR_NAME)
 FONTS_DIR = os.path.join(PROJECT_ROOT_DIR, FONTS_DIR_NAME)
 LOGS_DIR = os.path.join(PROJECT_ROOT_DIR, LOGS_DIR_NAME)
-HISTORY_DIR = os.path.join(PROJECT_ROOT_DIR, HISTORY_DIR_NAME) # 번역 히스토리 저장 경로
+HISTORY_DIR = os.path.join(PROJECT_ROOT_DIR, HISTORY_DIR_NAME)
 
 # --- Logging Configuration ---
 DEFAULT_LOG_LEVEL = logging.INFO
@@ -58,20 +56,19 @@ OCR_LANGUAGE_FONT_MAP = {
 OCR_DEFAULT_FONT_FILENAME = 'NotoSansCJK-Regular.ttc'
 OCR_DEFAULT_BOLD_FONT_FILENAME = 'NotoSansCJK-Bold.ttc'
 
-# --- Ollama Service Configuration (for ollama_service.py) ---
+# --- Ollama Service Configuration ---
 DEFAULT_OLLAMA_URL = "http://localhost:11434"
-OLLAMA_CONNECT_TIMEOUT = 5  # seconds
-OLLAMA_READ_TIMEOUT = 180   # seconds for general API calls
-OLLAMA_PULL_READ_TIMEOUT = None # 모델 다운로드는 매우 오래 걸릴 수 있음 (None은 무제한 대기)
-MODELS_CACHE_TTL_SECONDS = 300 # 모델 목록 API 결과 캐시 시간 (초), 예: 5분
+OLLAMA_CONNECT_TIMEOUT = 5
+OLLAMA_READ_TIMEOUT = 180
+OLLAMA_PULL_READ_TIMEOUT = None
+MODELS_CACHE_TTL_SECONDS = 300
 
-# --- Translator Configuration (for translator.py) ---
-TRANSLATOR_TEMPERATURE_GENERAL = 0.2 # 텍스트 번역 기본 온도
-MAX_TRANSLATION_WORKERS = 8
-MAX_OCR_WORKERS = MAX_TRANSLATION_WORKERS # OCR 작업자 수를 번역 작업자 수와 동일하게 설정 (필요시 분리)
+# --- Translator Configuration ---
+TRANSLATOR_TEMPERATURE_GENERAL = 0.2
+MAX_TRANSLATION_WORKERS = 16
+MAX_OCR_WORKERS = MAX_TRANSLATION_WORKERS
 
-
-# --- PPTX Handler Configuration (for pptx_handler.py) ---
+# --- PPTX Handler Configuration ---
 MIN_MEANINGFUL_CHAR_RATIO_SKIP = 0.1
 MIN_MEANINGFUL_CHAR_RATIO_OCR = 0.1
 
@@ -80,11 +77,20 @@ UI_LANG_TO_FONT_CODE_MAP = {
     "한국어": "korean", "일본어": "japan", "영어": "en",
     "중국어": "ch_doc", "대만어": "chinese_cht", "태국어": "th", "스페인어": "es",
 }
-MAX_HISTORY_ITEMS = 50 # 번역 히스토리 최대 저장 개수
+MAX_HISTORY_ITEMS = 50
+UI_PROGRESS_UPDATE_INTERVAL = 0.2 # 초 단위, UI 진행률 업데이트 최소 간격
 
-# --- Advanced Options Defaults (애플리케이션 기본값, 사용자 설정에 의해 덮어쓰여질 수 있음) ---
+# --- Advanced Options Defaults ---
 DEFAULT_ADVANCED_SETTINGS = {
     "ocr_temperature": 0.4,
     "image_translation_enabled": True,
     "ocr_use_gpu": False
 }
+
+# --- XML Namespaces (공통 사용 가능성) ---
+# 필요시 ChartXmlHandler에서 여기로 옮기거나 utils.py에 함수로 정의
+# XML_NAMESPACES = {
+#     'c': 'http://schemas.openxmlformats.org/drawingml/2006/chart',
+#     'a': 'http://schemas.openxmlformats.org/drawingml/2006/main',
+#     # ... 기타 네임스페이스
+# }

@@ -1,0 +1,5 @@
+{
+    "ocr_temperature": 0.4,
+    "image_translation_enabled": true,
+    "ocr_use_gpu": false
+}

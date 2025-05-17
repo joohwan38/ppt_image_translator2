@@ -13,28 +13,27 @@ from datetime import datetime
 import atexit
 import tempfile
 import shutil
-import json # For history and user settings
-from typing import Optional, List, Dict, Any, Callable
+import json
+from typing import Optional, List, Dict, Any, Callable # IO 추가 (혹시 필요할 수 있음)
 import traceback
-
 
 from pptx import Presentation
 
-# 프로젝트 설정 파일 import
 import config
-
-# 프로젝트 루트의 다른 .py 파일들 import
+# --- 2단계: DIP 적용 (인터페이스를 통해 의존성 주입) ---
+from interfaces import AbsOllamaService, AbsTranslator, AbsPptxProcessor, AbsChartProcessor, AbsOcrHandler, AbsOcrHandlerFactory
+# 실제 구현체는 __main__ 블록에서 주입
+from ollama_service import OllamaService
 from translator import OllamaTranslator
 from pptx_handler import PptxHandler
-from ocr_handler import PaddleOcrHandler, EasyOcrHandler # BaseOcrHandler는 여기서 직접 사용 안 함
-from ollama_service import OllamaService
 from chart_xml_handler import ChartXmlHandler
+from ocr_handler import OcrHandlerFactory # 실제 팩토리 구현체
+
 import utils
 
 # --- 로깅 설정 ---
 debug_mode = "--debug" in sys.argv
 log_level = config.DEBUG_LOG_LEVEL if debug_mode else config.DEFAULT_LOG_LEVEL
-
 root_logger = logging.getLogger()
 root_logger.setLevel(log_level)
 formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -43,45 +42,103 @@ console_handler.setFormatter(formatter)
 if not any(isinstance(h, logging.StreamHandler) for h in root_logger.handlers):
     root_logger.addHandler(console_handler)
 
-# --- 경로 설정 (config.py에서 가져옴) ---
+# --- 경로 설정 ---
 BASE_DIR_MAIN = os.path.dirname(os.path.abspath(__file__))
 ASSETS_DIR = config.ASSETS_DIR
 FONTS_DIR = config.FONTS_DIR
 LOGS_DIR = config.LOGS_DIR
-HISTORY_DIR = config.HISTORY_DIR # 번역 히스토리 저장 경로 (config.py에서 정의)
+HISTORY_DIR = config.HISTORY_DIR
 USER_SETTINGS_PATH = os.path.join(BASE_DIR_MAIN, config.USER_SETTINGS_FILENAME)
-
 
 logger = logging.getLogger(__name__)
 
-# --- 전역 변수 및 설정 (config.py에서 가져옴) ---
+# --- 전역 변수 ---
 APP_NAME = config.APP_NAME
 DEFAULT_MODEL = config.DEFAULT_OLLAMA_MODEL
 SUPPORTED_LANGUAGES = config.SUPPORTED_LANGUAGES
 
 
 class Application(tk.Frame):
-    def __init__(self, master=None):
+    def __init__(self, master=None,
+                 ollama_service: AbsOllamaService = None,
+                 translator: AbsTranslator = None,
+                 pptx_handler: AbsPptxProcessor = None,
+                 chart_processor: AbsChartProcessor = None,
+                 ocr_handler_factory: AbsOcrHandlerFactory = None # 인터페이스 타입으로 변경
+                 ):
         super().__init__(master)
         self.master = master
         self.master.title(APP_NAME)
-        self.general_file_handler = None # 파일 로깅 핸들러
-        self._setup_logging_file_handler() # 로깅 핸들러 먼저 설정
+        self.general_file_handler: Optional[logging.FileHandler] = None
+        self._setup_logging_file_handler()
 
         self.user_settings: Dict[str, Any] = {}
-        self._load_user_settings() # 사용자 설정 로드
+        self._load_user_settings()
 
-        # 서비스/핸들러 인스턴스 생성 (2단계에서 인터페이스 기반 주입으로 변경 예정)
-        self.ollama_service = OllamaService()
-        self.translator = OllamaTranslator()
-        self.pptx_handler = PptxHandler()
-        # ChartXmlHandler는 translator와 ollama_service에 의존하므로, 해당 인스턴스 전달
-        self.chart_xml_handler = ChartXmlHandler(self.translator, self.ollama_service)
-        self.ocr_handler = None # 동적으로 생성 (PaddleOcrHandler 또는 EasyOcrHandler)
-        self.current_ocr_engine_type = None # 현재 사용 중인 OCR 엔진 ("paddleocr" 또는 "easyocr")
+        # --- 2단계: 의존성 주입 ---
+        self.ollama_service = ollama_service if ollama_service else OllamaService()
+        self.translator = translator if translator else OllamaTranslator()
+        self.pptx_handler = pptx_handler if pptx_handler else PptxHandler()
+        self.chart_xml_handler = chart_processor if chart_processor else ChartXmlHandler(self.translator, self.ollama_service)
+        self.ocr_handler_factory = ocr_handler_factory if ocr_handler_factory else OcrHandlerFactory()
+
+        self.ocr_handler: Optional[AbsOcrHandler] = None
+        self.current_ocr_engine_type: Optional[str] = None
+
+        self._set_app_icon()
+
+        self.style = ttk.Style()
+        current_os = platform.system()
+        if current_os == "Windows": self.style.theme_use('vista')
+        elif current_os == "Darwin": self.style.theme_use('aqua')
+        else: self.style.theme_use('clam')
+
+        self.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        self.translation_thread: Optional[threading.Thread] = None
+        self.model_download_thread: Optional[threading.Thread] = None
+        self.stop_event = threading.Event()
+        self.logo_image_tk_bottom: Optional[tk.PhotoImage] = None
+        self.start_time: Optional[float] = None
+
+        self.current_file_slide_count = 0
+        self.current_file_total_text_chars = 0
+        self.current_file_image_elements_count = 0
+        self.current_file_chart_elements_count = 0
+        self.total_weighted_work = 0
+        self.current_weighted_done = 0
+
+        # --- 3단계: UI 반응성 개선용 변수 ---
+        self.last_progress_update_time = 0.0
+        self.min_progress_update_interval = config.UI_PROGRESS_UPDATE_INTERVAL
+        self.progress_update_threshold = 0.5
+        self.last_reported_progress_percent = 0.0
+
+        self.history_file_path = os.path.join(HISTORY_DIR, "translation_history.json")
+        self.translation_history_data: List[Dict[str, Any]] = []
+
+        self.ocr_temperature_var = tk.DoubleVar(
+            value=self.user_settings.get("ocr_temperature", config.DEFAULT_ADVANCED_SETTINGS["ocr_temperature"])
+        )
+        self.image_translation_enabled_var = tk.BooleanVar(
+            value=self.user_settings.get("image_translation_enabled", config.DEFAULT_ADVANCED_SETTINGS["image_translation_enabled"])
+        )
+        self.ocr_use_gpu_var = tk.BooleanVar(
+            value=self.user_settings.get("ocr_use_gpu", config.DEFAULT_ADVANCED_SETTINGS["ocr_use_gpu"])
+        )
+
+        self.create_widgets()
+        self._load_translation_history()
+        self.master.after(100, self.initial_checks)
+        self.master.protocol("WM_DELETE_WINDOW", self.on_closing)
+        atexit.register(self.on_closing)
+
+        log_file_path_msg = self.general_file_handler.baseFilename if self.general_file_handler else '미설정'
+        logger.info(f"--- {APP_NAME} 시작됨 (일반 로그 파일: {log_file_path_msg}) ---")
+        logger.info(f"로드된 사용자 설정: {self.user_settings}")
 
 
-        # 아이콘 설정
+    def _set_app_icon(self): # 메서드 분리
         app_icon_png_path = os.path.join(ASSETS_DIR, "app_icon.png")
         app_icon_ico_path = os.path.join(ASSETS_DIR, "app_icon.ico")
         icon_set = False
@@ -94,7 +151,7 @@ class Application(tk.Frame):
                     icon_image_tk = tk.PhotoImage(file=app_icon_png_path, master=self.master)
                     self.master.iconphoto(True, icon_image_tk)
                     icon_set = True
-                except tk.TclError: # Tkinter PhotoImage가 PNG 직접 지원 못하는 경우
+                except tk.TclError:
                     try:
                         pil_icon = Image.open(app_icon_png_path)
                         icon_image_pil = ImageTk.PhotoImage(pil_icon, master=self.master)
@@ -103,65 +160,9 @@ class Application(tk.Frame):
                     except Exception as e_pil_icon_fallback:
                         logger.warning(f"Pillow로도 PNG 아이콘 설정 실패: {e_pil_icon_fallback}")
             if not icon_set:
-                logger.warning(f"애플리케이션 아이콘 파일을 찾을 수 없거나 설정 실패.")
+                logger.warning(f"애플리케이션 아이콘 파일을 찾을 수 없거나 설정 실패: PNG='{app_icon_png_path}', ICO='{app_icon_ico_path}'")
         except Exception as e_icon_general:
             logger.warning(f"애플리케이션 아이콘 설정 중 예외: {e_icon_general}", exc_info=True)
-
-
-        # 스타일 설정
-        self.style = ttk.Style()
-        current_os = platform.system()
-        if current_os == "Windows":
-            self.style.theme_use('vista')
-        elif current_os == "Darwin": # macOS
-            self.style.theme_use('aqua')
-        else: # Linux 등 기타
-            self.style.theme_use('clam') # 'clam' 또는 'alt', 'default', 'classic' 등 사용 가능
-
-        self.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-
-
-        # UI 관련 변수 및 상태 변수
-        self.translation_thread = None
-        self.model_download_thread = None
-        self.stop_event = threading.Event()
-        self.logo_image_tk_bottom = None # 하단 로고 이미지
-        self.start_time = None # 번역 시작 시간
-
-        # 현재 파일 정보 및 진행률 관련 변수
-        self.current_file_slide_count = 0
-        self.current_file_total_text_chars = 0
-        self.current_file_image_elements_count = 0
-        self.current_file_chart_elements_count = 0
-        self.total_weighted_work = 0 # 총 예상 작업량 (가중치 적용)
-        self.current_weighted_done = 0 # 현재까지 완료된 작업량 (가중치 적용)
-
-        # 번역 히스토리 관련
-        self.history_file_path = os.path.join(HISTORY_DIR, "translation_history.json")
-        self.translation_history_data: List[Dict[str, Any]] = []
-
-
-        # 고급 옵션 UI 변수 (tk.BooleanVar, tk.DoubleVar 등)
-        # Application 생성자에서 tk.BooleanVar 등의 초기값을 저장된 설정 또는 config.py의 기본값으로 설정
-        self.ocr_temperature_var = tk.DoubleVar(
-            value=self.user_settings.get("ocr_temperature", config.DEFAULT_ADVANCED_SETTINGS["ocr_temperature"])
-        )
-        self.image_translation_enabled_var = tk.BooleanVar(
-            value=self.user_settings.get("image_translation_enabled", config.DEFAULT_ADVANCED_SETTINGS["image_translation_enabled"])
-        )
-        self.ocr_use_gpu_var = tk.BooleanVar(
-            value=self.user_settings.get("ocr_use_gpu", config.DEFAULT_ADVANCED_SETTINGS["ocr_use_gpu"])
-        )
-
-        self.create_widgets()
-        self._load_translation_history() # 번역 히스토리 로드
-        self.master.after(100, self.initial_checks) # 초기 상태 점검 (Ollama, OCR 등)
-        self.master.protocol("WM_DELETE_WINDOW", self.on_closing) # 종료 시 처리
-        atexit.register(self.on_closing) # 비정상 종료 시에도 호출되도록
-
-        log_file_path_msg = self.general_file_handler.baseFilename if self.general_file_handler else '미설정'
-        logger.info(f"--- {APP_NAME} 시작됨 (일반 로그 파일: {log_file_path_msg}) ---")
-        logger.info(f"로드된 사용자 설정: {self.user_settings}")
 
 
     def _setup_logging_file_handler(self):
@@ -221,25 +222,20 @@ class Application(tk.Frame):
         except Exception as e:
             logger.error(f"사용자 설정 저장 중 오류: {e}", exc_info=True)
 
-
-    def _destroy_current_ocr_handler(self):
+    def _destroy_current_ocr_handler(self): # 2단계: OCR 핸들러 관리 로직은 팩토리 또는 OCR 관리 서비스로 이동/통합될 수 있음 (현재는 유지)
         if self.ocr_handler:
             logger.info(f"기존 OCR 핸들러 ({self.current_ocr_engine_type}) 자원 해제 시도...")
-            # OCR 엔진 객체가 ocr_engine 속성에 저장되어 있다고 가정
             if hasattr(self.ocr_handler, 'ocr_engine') and self.ocr_handler.ocr_engine:
                 try:
-                    # PaddleOCR/EasyOCR의 명시적인 자원 해제 함수가 있다면 호출
-                    # 예: if hasattr(self.ocr_handler.ocr_engine, 'release'): self.ocr_handler.ocr_engine.release()
-                    del self.ocr_handler.ocr_engine # 참조 제거로 GC 유도
+                    # 명시적인 release 함수가 있다면 호출 (예: PaddleOCR의 경우 내부적으로 처리될 수 있음)
+                    # if hasattr(self.ocr_handler.ocr_engine, 'release'): self.ocr_handler.ocr_engine.release()
+                    del self.ocr_handler.ocr_engine
                     logger.debug(f"{self.current_ocr_engine_type} 엔진 객체 참조 제거됨.")
                 except Exception as e:
                     logger.warning(f"OCR 엔진 객체('ocr_engine') 삭제 중 오류: {e}")
 
             self.ocr_handler = None
             self.current_ocr_engine_type = None
-            # 강제 GC (메모리 회수에 도움될 수 있으나, 남용 주의)
-            # import gc
-            # gc.collect()
             logger.info("기존 OCR 핸들러 자원 해제 완료.")
 
 
@@ -299,33 +295,24 @@ class Application(tk.Frame):
         logger.debug("초기 점검 완료.")
 
     def create_widgets(self):
-        # 이전에 제공된 create_widgets 코드를 기반으로 복원합니다.
-        # 고급 옵션 팝업에서 변수 초기화 시 self.user_settings 또는 config.DEFAULT_ADVANCED_SETTINGS 사용
-        # self.ocr_temperature_var, self.image_translation_enabled_var, self.ocr_use_gpu_var는
-        # __init__에서 이미 사용자 설정/기본값으로 초기화되었으므로, create_widgets에서는 해당 변수 사용.
+        # UI 요소 생성 및 배치
+        # 이전에 제공된 create_widgets 코드를 기반으로 복원 및 재구성합니다.
+        # ttk 스타일 적용 부분을 __init__으로 옮겨도 무방합니다.
 
         top_frame = ttk.Frame(self)
         top_frame.pack(fill=tk.BOTH, expand=True)
 
         bottom_frame = ttk.Frame(self, height=30)
         bottom_frame.pack(fill=tk.X, side=tk.BOTTOM, pady=(5,0))
-        bottom_frame.pack_propagate(False) # 높이 고정
+        bottom_frame.pack_propagate(False)
 
-        # 메인 화면을 좌우로 나누는 PanedWindow
         main_paned_window = ttk.PanedWindow(top_frame, orient=tk.HORIZONTAL)
         main_paned_window.pack(fill=tk.BOTH, expand=True)
 
-        # 왼쪽 패널 (입력, 옵션, 진행상황 등)
+        # --- 왼쪽 패널 ---
         left_panel = ttk.Frame(main_paned_window, padding=10)
-        main_paned_window.add(left_panel, weight=3) # 왼쪽 패널이 더 넓게
+        main_paned_window.add(left_panel, weight=3) # 왼쪽 패널 비중 조절
 
-        # 오른쪽 패널 (로그, 히스토리, 고급옵션 버튼 등)
-        right_panel = ttk.Frame(main_paned_window, padding=0) # 오른쪽은 패딩 최소화
-        main_paned_window.add(right_panel, weight=2)
-
-
-        # --- Left Panel ---
-        # 파일 경로 프레임
         path_frame = ttk.LabelFrame(left_panel, text="파일 경로", padding=5)
         path_frame.pack(padx=5, pady=(0,5), fill=tk.X)
         self.file_path_var = tk.StringVar()
@@ -334,14 +321,11 @@ class Application(tk.Frame):
         browse_button = ttk.Button(path_frame, text="찾아보기", command=self.browse_file)
         browse_button.pack(side=tk.LEFT)
 
-        # 서버 상태 프레임
         server_status_frame = ttk.LabelFrame(left_panel, text="서버 상태", padding=5)
         server_status_frame.pack(padx=5, pady=5, fill=tk.X)
-        server_status_frame.columnconfigure(1, weight=1) # Ollama 실행 상태 레이블이 공간 차지하도록
-
+        server_status_frame.columnconfigure(1, weight=1)
         self.os_label = ttk.Label(server_status_frame, text=f"OS: {platform.system()} {platform.release()}")
         self.os_label.grid(row=0, column=0, columnspan=2, padx=5, pady=2, sticky=tk.W)
-
         self.ollama_status_label = ttk.Label(server_status_frame, text="Ollama 설치: 미확인")
         self.ollama_status_label.grid(row=1, column=0, padx=5, pady=2, sticky=tk.W)
         self.ollama_running_label = ttk.Label(server_status_frame, text="Ollama 실행: 미확인")
@@ -350,23 +334,17 @@ class Application(tk.Frame):
         self.ollama_port_label.grid(row=1, column=2, padx=5, pady=2, sticky=tk.W)
         self.ollama_check_button = ttk.Button(server_status_frame, text="Ollama 확인", command=self.check_ollama_status_manual)
         self.ollama_check_button.grid(row=1, column=3, padx=5, pady=2, sticky=tk.E)
-
         self.ocr_status_label = ttk.Label(server_status_frame, text="OCR 상태: 미확인")
         self.ocr_status_label.grid(row=2, column=0, columnspan=4, padx=5, pady=2, sticky=tk.W)
 
-
-        # 파일 정보 및 진행 상황 표시를 위한 프레임 (좌우로 나눔)
         file_progress_outer_frame = ttk.Frame(left_panel)
         file_progress_outer_frame.pack(padx=5, pady=5, fill=tk.X)
-
-        # 파일 정보 표시 프레임 (왼쪽)
         file_info_frame = ttk.LabelFrame(file_progress_outer_frame, text="파일 정보", padding=5)
         file_info_frame.pack(side=tk.LEFT, padx=(0,5), fill=tk.BOTH, expand=True)
         self.file_name_label = ttk.Label(file_info_frame, text="파일 이름: ")
         self.file_name_label.pack(anchor=tk.W, pady=1)
         self.slide_count_label = ttk.Label(file_info_frame, text="슬라이드 수: ")
         self.slide_count_label.pack(anchor=tk.W, pady=1)
-
         self.total_text_char_label = ttk.Label(file_info_frame, text="텍스트 글자 수: ")
         self.total_text_char_label.pack(anchor=tk.W, pady=1)
         self.image_elements_label = ttk.Label(file_info_frame, text="이미지 수: ")
@@ -374,8 +352,6 @@ class Application(tk.Frame):
         self.chart_elements_label = ttk.Label(file_info_frame, text="차트 수: ")
         self.chart_elements_label.pack(anchor=tk.W, pady=1)
 
-
-        # 진행 상황 정보 표시 프레임 (오른쪽)
         progress_info_frame = ttk.LabelFrame(file_progress_outer_frame, text="진행 상황", padding=5)
         progress_info_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self.current_slide_label = ttk.Label(progress_info_frame, text="현재 위치: -")
@@ -383,54 +359,40 @@ class Application(tk.Frame):
         self.current_work_label = ttk.Label(progress_info_frame, text="현재 작업: 대기 중")
         self.current_work_label.pack(anchor=tk.W, pady=1)
 
-
-        # 번역 옵션 프레임
         translation_options_frame = ttk.LabelFrame(left_panel, text="번역 옵션", padding=5)
         translation_options_frame.pack(padx=5, pady=5, fill=tk.X)
-        translation_options_frame.columnconfigure(1, weight=1) # 원본 언어 콤보박스 확장
-        translation_options_frame.columnconfigure(4, weight=1) # 번역 언어 콤보박스 확장
-
+        translation_options_frame.columnconfigure(1, weight=1)
+        translation_options_frame.columnconfigure(4, weight=1)
         ttk.Label(translation_options_frame, text="원본 언어:").grid(row=0, column=0, padx=5, pady=5, sticky=tk.W)
         self.src_lang_var = tk.StringVar(value=SUPPORTED_LANGUAGES[0])
         self.src_lang_combo = ttk.Combobox(translation_options_frame, textvariable=self.src_lang_var, values=SUPPORTED_LANGUAGES, state="readonly", width=12)
         self.src_lang_combo.grid(row=0, column=1, padx=5, pady=5, sticky=tk.EW)
         self.src_lang_combo.bind("<<ComboboxSelected>>", self.on_source_language_change)
-
         self.swap_button = ttk.Button(translation_options_frame, text="↔", command=self.swap_languages, width=3)
         self.swap_button.grid(row=0, column=2, padx=5, pady=5)
-
         ttk.Label(translation_options_frame, text="번역 언어:").grid(row=0, column=3, padx=5, pady=5, sticky=tk.W)
         self.tgt_lang_var = tk.StringVar(value=SUPPORTED_LANGUAGES[1])
         self.tgt_lang_combo = ttk.Combobox(translation_options_frame, textvariable=self.tgt_lang_var, values=SUPPORTED_LANGUAGES, state="readonly", width=12)
         self.tgt_lang_combo.grid(row=0, column=4, padx=5, pady=5, sticky=tk.EW)
 
-        # 모델 선택 부분 (콤보박스와 새로고침 버튼을 한 프레임에)
-        model_selection_frame = ttk.Frame(translation_options_frame) # 패딩 제거
-        model_selection_frame.grid(row=1, column=1, columnspan=4, padx=0, pady=0, sticky=tk.EW) # columnspan=4로 확장
-        model_selection_frame.columnconfigure(0, weight=1) # 콤보박스가 남은 공간 모두 차지
-
+        model_selection_frame = ttk.Frame(translation_options_frame)
+        model_selection_frame.grid(row=1, column=1, columnspan=4, padx=0, pady=0, sticky=tk.EW)
+        model_selection_frame.columnconfigure(0, weight=1)
         ttk.Label(translation_options_frame, text="번역 모델:").grid(row=1, column=0, padx=5, pady=5, sticky=tk.W)
         self.model_var = tk.StringVar(value=DEFAULT_MODEL)
-        self.model_combo = ttk.Combobox(model_selection_frame, textvariable=self.model_var, state="disabled") # 초기 비활성화
+        self.model_combo = ttk.Combobox(model_selection_frame, textvariable=self.model_var, state="disabled")
         self.model_combo.grid(row=0, column=0, padx=(5,0), pady=5, sticky=tk.EW)
         self.model_refresh_button = ttk.Button(model_selection_frame, text="🔄", command=self.load_ollama_models, width=3)
-        self.model_refresh_button.grid(row=0, column=1, padx=(2,5), pady=5, sticky=tk.W) # 오른쪽 끝에 붙임
+        self.model_refresh_button.grid(row=0, column=1, padx=(2,5), pady=5, sticky=tk.W)
 
-
-        # 시작/중지 버튼 프레임
-        action_buttons_frame = ttk.Frame(left_panel, padding=(0,5,0,0)) # 버튼 간격 조절
+        action_buttons_frame = ttk.Frame(left_panel, padding=(0,5,0,0))
         action_buttons_frame.pack(padx=5, pady=10, fill=tk.X)
-
-        self.style.configure("Big.TButton", font=('TkDefaultFont', 11, 'bold'), foreground="black") # 버튼 스타일
-
+        self.style.configure("Big.TButton", font=('TkDefaultFont', 11, 'bold'), foreground="black")
         self.start_button = ttk.Button(action_buttons_frame, text="번역 시작", command=self.start_translation, style="Big.TButton")
         self.start_button.pack(side=tk.LEFT, padx=(0,5), expand=True, fill=tk.X, ipady=10)
-
         self.stop_button = ttk.Button(action_buttons_frame, text="번역 중지", command=self.stop_translation, state=tk.DISABLED, style="Big.TButton")
         self.stop_button.pack(side=tk.LEFT, expand=True, fill=tk.X, ipady=10)
 
-
-        # 진행률 표시 바 프레임
         progress_bar_frame = ttk.Frame(left_panel)
         progress_bar_frame.pack(padx=5, pady=5, fill=tk.X)
         self.progress_bar = ttk.Progressbar(progress_bar_frame, orient="horizontal", length=300, mode="determinate")
@@ -438,8 +400,6 @@ class Application(tk.Frame):
         self.progress_label_var = tk.StringVar(value="0%")
         ttk.Label(progress_bar_frame, textvariable=self.progress_label_var).pack(side=tk.LEFT)
 
-
-        # 번역 완료 파일 경로 프레임
         self.translated_file_path_var = tk.StringVar()
         translated_file_frame = ttk.LabelFrame(left_panel, text="번역 완료 파일", padding=5)
         translated_file_frame.pack(padx=5, pady=5, fill=tk.X)
@@ -448,25 +408,22 @@ class Application(tk.Frame):
         self.open_folder_button = ttk.Button(translated_file_frame, text="폴더 열기", command=self.open_translated_folder, state=tk.DISABLED)
         self.open_folder_button.pack(side=tk.LEFT)
 
+        # --- 오른쪽 패널 ---
+        right_panel = ttk.Frame(main_paned_window, padding=10)  # right_panel을 ttk.Frame으로 정의
+        main_paned_window.add(right_panel, weight=2)           # right_panel을 main_paned_window에 추가 (weight는 원하는 비율로 조정)
+        right_top_frame = ttk.Frame(right_panel)
+        right_top_frame.pack(fill=tk.BOTH, expand=True)
 
-        # --- Right Panel (로그, 히스토리, 고급옵션 버튼) ---
-        right_top_frame = ttk.Frame(right_panel) # 로그/히스토리용 노트북이 들어갈 프레임
-        right_top_frame.pack(fill=tk.BOTH, expand=True) # 위쪽 공간 모두 차지
 
-        # 고급 옵션 버튼 (팝업으로 변경)
         advanced_options_button = ttk.Button(
             right_panel, text="고급 옵션 설정...",
             command=self.open_advanced_options_popup
         )
-        advanced_options_button.pack(fill=tk.X, padx=5, pady=(5,0), side=tk.BOTTOM) # 노트북 아래에 배치
+        advanced_options_button.pack(fill=tk.X, padx=5, pady=(5,0), side=tk.BOTTOM)
 
-
-        # 로그 및 히스토리 탭을 위한 Notebook 위젯
-        right_panel_notebook = ttk.Notebook(right_top_frame) # 오른쪽 패널 상단에 위치
+        right_panel_notebook = ttk.Notebook(right_top_frame)
         right_panel_notebook.pack(fill=tk.BOTH, expand=True, pady=(0,0))
 
-
-        # 실행 로그 탭
         log_tab_frame = ttk.Frame(right_panel_notebook, padding=5)
         right_panel_notebook.add(log_tab_frame, text="실행 로그")
         self.log_text = tk.Text(log_tab_frame, state=tk.DISABLED, wrap=tk.WORD, relief=tk.SOLID, borderwidth=1, font=("TkFixedFont", 9))
@@ -475,19 +432,15 @@ class Application(tk.Frame):
         log_scrollbar_y.pack(side=tk.RIGHT, fill=tk.Y)
         self.log_text.pack(fill=tk.BOTH, expand=True)
 
-        # 로깅 핸들러 설정 (Text 위젯으로 로그 출력)
         text_widget_handler = TextHandler(self.log_text)
         text_widget_handler.setFormatter(formatter)
-        if not any(isinstance(h, TextHandler) for h in root_logger.handlers): # 중복 추가 방지
+        if not any(isinstance(h, TextHandler) for h in root_logger.handlers):
             root_logger.addHandler(text_widget_handler)
 
-
-        # 번역 히스토리 탭
         history_tab_frame = ttk.Frame(right_panel_notebook, padding=5)
         right_panel_notebook.add(history_tab_frame, text="번역 히스토리")
-        history_columns = ("name", "src", "tgt", "model", "ocr_temp", "status", "time", "path") # 컬럼 정의
-        self.history_tree = ttk.Treeview(history_tab_frame, columns=history_columns, show="headings") # 헤더만 표시
-        # 각 컬럼 설정
+        history_columns = ("name", "src", "tgt", "model", "ocr_temp", "status", "time", "path")
+        self.history_tree = ttk.Treeview(history_tab_frame, columns=history_columns, show="headings")
         self.history_tree.heading("name", text="문서 이름"); self.history_tree.column("name", width=120, anchor=tk.W, stretch=tk.YES)
         self.history_tree.heading("src", text="원본"); self.history_tree.column("src", width=50, anchor=tk.CENTER)
         self.history_tree.heading("tgt", text="대상"); self.history_tree.column("tgt", width=50, anchor=tk.CENTER)
@@ -495,7 +448,7 @@ class Application(tk.Frame):
         self.history_tree.heading("ocr_temp", text="OCR온도"); self.history_tree.column("ocr_temp", width=60, anchor=tk.CENTER)
         self.history_tree.heading("status", text="결과"); self.history_tree.column("status", width=60, anchor=tk.CENTER)
         self.history_tree.heading("time", text="번역일시"); self.history_tree.column("time", width=110, anchor=tk.CENTER)
-        self.history_tree.heading("path", text="경로"); self.history_tree.column("path", width=0, stretch=tk.NO) # 경로는 숨김 (더블클릭 시 사용)
+        self.history_tree.heading("path", text="경로"); self.history_tree.column("path", width=0, stretch=tk.NO)
 
         hist_scrollbar_y = ttk.Scrollbar(history_tab_frame, orient="vertical", command=self.history_tree.yview)
         hist_scrollbar_x = ttk.Scrollbar(history_tab_frame, orient="horizontal", command=self.history_tree.xview)
@@ -503,8 +456,7 @@ class Application(tk.Frame):
         hist_scrollbar_y.pack(side=tk.RIGHT, fill=tk.Y)
         hist_scrollbar_x.pack(side=tk.BOTTOM, fill=tk.X)
         self.history_tree.pack(fill=tk.BOTH, expand=True)
-        self.history_tree.bind("<Double-1>", self.on_history_double_click) # 더블클릭 이벤트 바인딩
-
+        self.history_tree.bind("<Double-1>", self.on_history_double_click)
 
         # --- 하단 로고 ---
         logo_path_bottom = os.path.join(ASSETS_DIR, "LINEstudio2.png")
@@ -513,10 +465,8 @@ class Application(tk.Frame):
                 pil_temp_for_size = Image.open(logo_path_bottom)
                 original_width, original_height = pil_temp_for_size.size
                 pil_temp_for_size.close()
-
                 target_height_bottom = 20
                 subsample_factor = max(1, int(original_height / target_height_bottom)) if original_height > target_height_bottom and target_height_bottom > 0 else (1 if original_height > 0 else 6)
-
                 temp_logo_image_bottom = tk.PhotoImage(file=logo_path_bottom, master=self.master)
                 self.logo_image_tk_bottom = temp_logo_image_bottom.subsample(subsample_factor, subsample_factor)
                 logo_label_bottom = ttk.Label(bottom_frame, image=self.logo_image_tk_bottom)
@@ -525,7 +475,6 @@ class Application(tk.Frame):
                 logger.warning(f"하단 로고 로드 중 예외: {e_general_bottom}", exc_info=True)
         else:
             logger.warning(f"하단 로고 파일({logo_path_bottom})을 찾을 수 없습니다.")
-
 
     def open_advanced_options_popup(self):
         popup = tk.Toplevel(self.master)
@@ -679,29 +628,29 @@ class Application(tk.Frame):
         if self.translation_history_data:
             self.history_tree.yview_moveto(0)
 
-    def update_ocr_status_display(self):
+    def update_ocr_status_display(self): # 2단계: OCR 핸들러 팩토리 사용에 따른 수정
         selected_ui_lang = self.src_lang_var.get()
-        use_easyocr = selected_ui_lang in config.EASYOCR_SUPPORTED_UI_LANGS
-        engine_name_display = "EasyOCR" if use_easyocr else "PaddleOCR"
+        # OcrHandlerFactory를 통해 엔진 이름과 OCR 언어 코드 가져오기
+        engine_name_display = self.ocr_handler_factory.get_engine_name_display(selected_ui_lang)
+        ocr_lang_code_to_use = self.ocr_handler_factory.get_ocr_lang_code(selected_ui_lang)
+
         gpu_enabled_for_ocr = self.ocr_use_gpu_var.get()
         gpu_status_text = "(GPU 사용 예정)" if gpu_enabled_for_ocr else "(CPU 사용 예정)"
 
         if self.ocr_handler and self.current_ocr_engine_type == engine_name_display.lower():
             current_handler_lang_display = ""
-            if self.current_ocr_engine_type == "paddleocr" and hasattr(self.ocr_handler, 'current_lang_codes'):
-                current_handler_lang_display = self.ocr_handler.current_lang_codes
-            elif self.current_ocr_engine_type == "easyocr" and hasattr(self.ocr_handler, 'current_lang_codes') and self.ocr_handler.current_lang_codes:
-                current_handler_lang_display = ", ".join(self.ocr_handler.current_lang_codes)
+            # 현재 핸들러의 언어 코드 가져오기 (AbsOcrHandler 인터페이스의 current_lang_codes 속성 사용)
+            handler_langs = self.ocr_handler.current_lang_codes
+            if isinstance(handler_langs, list): # EasyOCR의 경우 리스트일 수 있음
+                current_handler_lang_display = ", ".join(handler_langs)
+            elif isinstance(handler_langs, str): # PaddleOCR의 경우 문자열
+                current_handler_lang_display = handler_langs
 
             gpu_in_use_text = "(GPU 사용 중)" if self.ocr_handler.use_gpu else "(CPU 사용 중)"
             self.ocr_status_label.config(text=f"{engine_name_display}: 준비됨 ({current_handler_lang_display}) {gpu_in_use_text}")
         else:
-            ocr_lang_code_to_use = ""
-            if use_easyocr:
-                ocr_lang_code_to_use = config.UI_LANG_TO_EASYOCR_CODE_MAP.get(selected_ui_lang, "")
-            else:
-                ocr_lang_code_to_use = config.UI_LANG_TO_PADDLEOCR_CODE_MAP.get(selected_ui_lang, config.DEFAULT_PADDLE_OCR_LANG)
             self.ocr_status_label.config(text=f"{engine_name_display}: ({ocr_lang_code_to_use or selected_ui_lang}) 사용 예정 {gpu_status_text} (미확인)")
+
 
 
     def on_source_language_change(self, event=None):
@@ -928,22 +877,16 @@ class Application(tk.Frame):
         if hasattr(self, 'master') and self.master.winfo_exists():
             self.master.after(0, _update)
 
-    def check_ocr_engine_status(self, is_called_from_start_translation=False):
+    def check_ocr_engine_status(self, is_called_from_start_translation=False): # 2단계: OCR 핸들러 팩토리 사용 및 관리 로직 변경
         self.current_work_label.config(text="OCR 엔진 확인 중...")
         self.master.update_idletasks()
 
         selected_ui_lang = self.src_lang_var.get()
-        use_easyocr = selected_ui_lang in config.EASYOCR_SUPPORTED_UI_LANGS
-        engine_name_display = "EasyOCR" if use_easyocr else "PaddleOCR"
-        engine_name_internal = engine_name_display.lower()
-        ocr_lang_code = None
-        if use_easyocr:
-            ocr_lang_code = config.UI_LANG_TO_EASYOCR_CODE_MAP.get(selected_ui_lang)
-        else:
-            ocr_lang_code = config.UI_LANG_TO_PADDLEOCR_CODE_MAP.get(selected_ui_lang, config.DEFAULT_PADDLE_OCR_LANG)
+        engine_name_display = self.ocr_handler_factory.get_engine_name_display(selected_ui_lang)
+        ocr_lang_code_to_use = self.ocr_handler_factory.get_ocr_lang_code(selected_ui_lang)
 
-        if not ocr_lang_code:
-            msg = f"{engine_name_display}: 언어 '{selected_ui_lang}'에 대한 OCR 코드가 설정되지 않았습니다."
+        if not ocr_lang_code_to_use:
+            msg = f"{engine_name_display}: UI 언어 '{selected_ui_lang}'에 대한 OCR 코드가 설정되지 않았습니다."
             self.ocr_status_label.config(text=msg)
             logger.error(msg)
             if is_called_from_start_translation:
@@ -953,64 +896,66 @@ class Application(tk.Frame):
 
         gpu_enabled_for_ocr = self.ocr_use_gpu_var.get()
         needs_reinit = False
-        if not self.ocr_handler: needs_reinit = True
-        elif self.current_ocr_engine_type != engine_name_internal: needs_reinit = True
-        elif self.ocr_handler.use_gpu != gpu_enabled_for_ocr: needs_reinit = True
-        elif engine_name_internal == "paddleocr" and self.ocr_handler.current_lang_codes != ocr_lang_code: needs_reinit = True
-        elif engine_name_internal == "easyocr" and (not self.ocr_handler.current_lang_codes or ocr_lang_code not in self.ocr_handler.current_lang_codes): needs_reinit = True
+
+        # OCR 핸들러 (재)초기화 필요 조건 검사
+        if not self.ocr_handler:
+            needs_reinit = True
+            logger.debug("OCR 핸들러 없음, 재초기화 필요.")
+        elif self.current_ocr_engine_type != engine_name_display.lower():
+            needs_reinit = True
+            logger.debug(f"OCR 엔진 타입 변경됨 ({self.current_ocr_engine_type} -> {engine_name_display.lower()}), 재초기화 필요.")
+        elif self.ocr_handler.use_gpu != gpu_enabled_for_ocr:
+            needs_reinit = True
+            logger.debug(f"OCR GPU 설정 변경됨 (현재: {self.ocr_handler.use_gpu}, 요청: {gpu_enabled_for_ocr}), 재초기화 필요.")
+        else:
+            # 엔진 타입과 GPU 설정이 동일한 경우, 언어 코드 확인
+            current_handler_langs = self.ocr_handler.current_lang_codes
+            if isinstance(current_handler_langs, list): # EasyOCR
+                if ocr_lang_code_to_use not in current_handler_langs:
+                    needs_reinit = True
+                    logger.debug(f"EasyOCR 언어 코드 변경됨 (현재: {current_handler_langs}, 요청: {ocr_lang_code_to_use}), 재초기화 필요.")
+            elif isinstance(current_handler_langs, str): # PaddleOCR
+                if current_handler_langs != ocr_lang_code_to_use:
+                    needs_reinit = True
+                    logger.debug(f"PaddleOCR 언어 코드 변경됨 (현재: {current_handler_langs}, 요청: {ocr_lang_code_to_use}), 재초기화 필요.")
 
         if needs_reinit:
-            self._destroy_current_ocr_handler()
-            logger.info(f"{engine_name_display} 핸들러 (재)초기화 시도 (언어: {ocr_lang_code}, GPU: {gpu_enabled_for_ocr}).")
-            self.current_work_label.config(text=f"{engine_name_display} 엔진 로딩 중 (언어: {ocr_lang_code}, GPU: {gpu_enabled_for_ocr})...")
+            self._destroy_current_ocr_handler() # 기존 핸들러 자원 해제
+            logger.info(f"{engine_name_display} 핸들러 (재)초기화 시도 (언어: {ocr_lang_code_to_use}, GPU: {gpu_enabled_for_ocr}).")
+            self.current_work_label.config(text=f"{engine_name_display} 엔진 로딩 중 (언어: {ocr_lang_code_to_use}, GPU: {gpu_enabled_for_ocr})...")
             self.master.update_idletasks()
-            try:
-                if use_easyocr:
-                    if not utils.check_easyocr():
-                        self.ocr_status_label.config(text=f"{engine_name_display}: 미설치")
-                        if messagebox.askyesno(f"{engine_name_display} 설치 필요", f"{engine_name_display}이(가) 설치되어 있지 않습니다. 지금 설치하시겠습니까?"):
-                            if utils.install_easyocr(): messagebox.showinfo(f"{engine_name_display} 설치 완료", f"{engine_name_display}이(가) 설치되었습니다. 애플리케이션을 재시작하거나 다시 시도해주세요.")
-                            else: messagebox.showerror(f"{engine_name_display} 설치 실패", f"{engine_name_display} 설치에 실패했습니다.")
-                        self.current_work_label.config(text=f"{engine_name_display} 미설치.")
-                        return False
-                    self.ocr_handler = EasyOcrHandler(lang_codes_list=[ocr_lang_code], debug_enabled=debug_mode, use_gpu=gpu_enabled_for_ocr)
-                    self.current_ocr_engine_type = "easyocr"
-                else:
-                    if not utils.check_paddleocr():
-                        self.ocr_status_label.config(text=f"{engine_name_display}: 미설치")
-                        if messagebox.askyesno(f"{engine_name_display} 설치 필요", f"{engine_name_display}(paddlepaddle)이(가) 설치되어 있지 않습니다. 지금 설치하시겠습니까?"):
-                            if utils.install_paddleocr(): messagebox.showinfo(f"{engine_name_display} 설치 완료", f"{engine_name_display}이(가) 설치되었습니다. 애플리케이션을 재시작하거나 다시 시도해주세요.")
-                            else: messagebox.showerror(f"{engine_name_display} 설치 실패", f"{engine_name_display} 설치에 실패했습니다.")
-                        self.current_work_label.config(text=f"{engine_name_display} 미설치.")
-                        return False
-                    self.ocr_handler = PaddleOcrHandler(lang_code=ocr_lang_code, debug_enabled=debug_mode, use_gpu=gpu_enabled_for_ocr)
-                    self.current_ocr_engine_type = "paddleocr"
-                logger.info(f"{engine_name_display} 핸들러 초기화 성공 (언어: {ocr_lang_code}, GPU: {gpu_enabled_for_ocr}).")
-                self.current_work_label.config(text=f"{engine_name_display} 엔진 로딩 완료.")
-            except RuntimeError as e:
-                logger.error(f"{engine_name_display} 핸들러 초기화 실패: {e}", exc_info=True)
-                self.ocr_status_label.config(text=f"{engine_name_display}: 초기화 실패 ({ocr_lang_code}, GPU:{gpu_enabled_for_ocr})")
-                if is_called_from_start_translation: messagebox.showerror(f"{engine_name_display} 오류", f"{engine_name_display} 초기화 중 오류:\n{e}\n\nGPU 관련 문제일 수 있습니다. GPU 사용 옵션을 확인해보세요.")
-                self._destroy_current_ocr_handler()
-                self.current_work_label.config(text=f"{engine_name_display} 엔진 초기화 실패!")
-                return False
-            except Exception as e_other:
-                 logger.error(f"{engine_name_display} 핸들러 생성 중 예기치 않은 오류: {e_other}", exc_info=True)
-                 self.ocr_status_label.config(text=f"{engine_name_display}: 알 수 없는 오류")
-                 if is_called_from_start_translation: messagebox.showerror(f"{engine_name_display} 오류", f"{engine_name_display} 처리 중 예기치 않은 오류:\n{e_other}")
-                 self._destroy_current_ocr_handler()
-                 self.current_work_label.config(text=f"{engine_name_display} 엔진 오류!")
-                 return False
 
-        self.update_ocr_status_display()
-        if self.ocr_handler and self.ocr_handler.ocr_engine: return True
+            # 팩토리를 통해 핸들러 생성 시도
+            # utils.check_easyocr/paddleocr는 팩토리 내부에서 호출될 수 있으므로, 여기서는 직접 호출 안 함
+            self.ocr_handler = self.ocr_handler_factory.get_ocr_handler(
+                lang_code_ui=selected_ui_lang,
+                use_gpu=gpu_enabled_for_ocr,
+                debug_enabled=debug_mode
+            )
+
+            if self.ocr_handler:
+                self.current_ocr_engine_type = engine_name_display.lower()
+                logger.info(f"{engine_name_display} 핸들러 초기화 성공 (언어: {ocr_lang_code_to_use}, GPU: {gpu_enabled_for_ocr}).")
+                self.current_work_label.config(text=f"{engine_name_display} 엔진 로딩 완료.")
+            else: # 핸들러 생성 실패 (팩토리 내부에서 로깅 및 오류 처리)
+                self.ocr_status_label.config(text=f"{engine_name_display}: 초기화 실패 ({ocr_lang_code_to_use}, GPU:{gpu_enabled_for_ocr})")
+                # 사용자에게는 팩토리에서 반환된 None을 기반으로 좀 더 일반적인 메시지 표시
+                if is_called_from_start_translation:
+                    messagebox.showerror(f"{engine_name_display} 오류", f"{engine_name_display} 엔진 초기화 중 오류가 발생했습니다.\n설치 상태 및 설정을 확인해주세요.\n자세한 내용은 로그 파일에서 확인할 수 있습니다.")
+                self.current_work_label.config(text=f"{engine_name_display} 엔진 초기화 실패!")
+                return False # OCR 준비 실패
+
+        self.update_ocr_status_display() # 최종 OCR 상태 UI 업데이트
+        # 핸들러와 엔진 객체가 모두 정상적으로 생성되었는지 확인
+        if self.ocr_handler and hasattr(self.ocr_handler, 'ocr_engine') and self.ocr_handler.ocr_engine:
+            return True
         else:
             self.ocr_status_label.config(text=f"{engine_name_display} OCR: 준비 안됨 ({selected_ui_lang})")
-            if is_called_from_start_translation and not needs_reinit : messagebox.showwarning("OCR 오류", f"{engine_name_display} OCR 엔진을 사용할 수 없습니다. 이전 로그를 확인해주세요.")
+            if is_called_from_start_translation and not needs_reinit : # 재초기화 시도가 아니었는데도 준비 안된 경우
+                 messagebox.showwarning("OCR 오류", f"{engine_name_display} OCR 엔진을 사용할 수 없습니다.\n(엔진 객체 생성 실패 또는 내부 오류)\n이전 로그를 확인해주세요.")
             self.current_work_label.config(text=f"{engine_name_display} OCR 준비 안됨.")
             return False
-
-
+        
     def swap_languages(self):
         src = self.src_lang_var.get()
         tgt = self.tgt_lang_var.get()
@@ -1019,7 +964,7 @@ class Application(tk.Frame):
         logger.info(f"언어 스왑: {tgt} <-> {src}")
         self.on_source_language_change()
 
-    def start_translation(self):
+    def start_translation(self): # 2단계: OCR 핸들러 관리 로직 변경, 3단계: UI 피드백 세분화 관련 로직 추가
         file_path = self.file_path_var.get()
         if not file_path or not os.path.exists(file_path):
             messagebox.showerror("파일 오류", "번역할 유효한 파워포인트 파일을 선택해주세요.\n'찾아보기' 버튼을 사용하여 파일을 선택할 수 있습니다.")
@@ -1028,22 +973,24 @@ class Application(tk.Frame):
         image_translation_really_enabled = self.image_translation_enabled_var.get()
         ocr_temperature_to_use = self.ocr_temperature_var.get()
 
+        # 이미지 번역이 활성화된 경우에만 OCR 엔진 상태 확인 및 준비
         if image_translation_really_enabled:
-            if not self.check_ocr_engine_status(is_called_from_start_translation=True):
-                if not messagebox.askyesno("OCR 준비 실패", "이미지 내 텍스트 번역에 필요한 OCR 기능이 준비되지 않았거나 사용할 수 없습니다.\n이 경우 이미지 안의 글자는 번역되지 않습니다.\n계속 진행하시겠습니까? (텍스트/차트만 번역)"):
+            if not self.check_ocr_engine_status(is_called_from_start_translation=True): # 번역 시작 시점에서 호출됨을 알림
+                # check_ocr_engine_status 내부에서 사용자에게 메시지 박스를 띄우므로, 여기서는 추가 메시지 최소화
+                if not messagebox.askyesno("OCR 준비 실패", "이미지 내 텍스트 번역에 필요한 OCR 기능이 준비되지 않았거나 사용할 수 없습니다.\n이 경우 이미지 안의 글자는 번역되지 않습니다.\n\n계속 진행하시겠습니까? (텍스트/차트만 번역)"):
                     logger.warning("OCR 준비 실패로 사용자가 번역을 취소했습니다.")
                     self.current_work_label.config(text="번역 취소됨 (OCR 준비 실패).")
                     return
                 logger.warning("OCR 핸들러 준비 실패. 이미지 번역 없이 진행합니다.")
-                image_translation_really_enabled = False
-        else:
+                image_translation_really_enabled = False # OCR 실패 시 이미지 번역 기능 내부적으로 비활성화
+        else: # 이미지 번역 옵션이 꺼져있다면
             logger.info("이미지 번역 옵션이 꺼져있으므로 OCR 엔진을 확인하지 않습니다.")
-            self._destroy_current_ocr_handler()
+            self._destroy_current_ocr_handler() # 사용 안 할 OCR 핸들러는 자원 해제
 
         src_lang, tgt_lang, model = self.src_lang_var.get(), self.tgt_lang_var.get(), self.model_var.get()
         if not model:
             messagebox.showerror("모델 오류", "번역 모델을 선택해주세요.\nOllama 서버가 실행 중이고 모델이 다운로드되었는지 확인하세요.\n'Ollama 확인' 버튼과 모델 목록 '🔄' 버튼을 사용해볼 수 있습니다.")
-            self.check_ollama_status_manual()
+            self.check_ollama_status_manual() # 상태 재확인 유도
             return
         if src_lang == tgt_lang:
             messagebox.showwarning("언어 동일", "원본 언어와 번역 언어가 동일합니다.\n다른 언어를 선택해주세요.")
@@ -1052,45 +999,54 @@ class Application(tk.Frame):
         ollama_running, _ = self.ollama_service.is_running()
         if not ollama_running:
             messagebox.showerror("Ollama 미실행", "Ollama 서버가 실행 중이지 않습니다.\nOllama를 실행한 후 'Ollama 확인' 버튼을 눌러주세요.")
-            self.check_ollama_status_manual()
+            self.check_ollama_status_manual() # 상태 재확인 및 자동 시작 시도
             return
 
-        if self.total_weighted_work <= 0:
+        if self.total_weighted_work <= 0: # 파일 정보 로드 후 작업량이 0인 경우
             logger.info("총 예상 작업량이 0입니다. 파일 정보를 다시 로드하여 확인합니다.")
-            self.load_file_info(file_path)
-            if self.total_weighted_work <= 0:
+            self.load_file_info(file_path) # 파일 정보 재로드
+            if self.total_weighted_work <= 0: # 그래도 0이면
                 messagebox.showinfo("정보", "번역할 내용이 없거나 작업량을 계산할 수 없습니다.\n파일 내용을 확인해주세요.")
                 logger.warning("재확인 후에도 총 예상 작업량이 0 이하입니다. 번역을 시작하지 않습니다.")
                 self.current_work_label.config(text="번역할 내용 없음.")
                 return
 
+        # 작업 로그 파일 이름 및 경로 설정
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         original_filename = os.path.basename(file_path)
+        # 파일명에서 확장자 제외하고, 유효한 문자만 남기기 (로그 파일명 오류 방지)
         safe_original_filename_part = "".join(c if c.isalnum() or c in ['.', '_'] else '_' for c in os.path.splitext(original_filename)[0])
         task_log_filename = f"translation_{timestamp}_{safe_original_filename_part}.log"
         task_log_filepath = os.path.join(LOGS_DIR, task_log_filename)
 
+        # 로깅 정보 구성 (실제 사용된 OCR 핸들러 정보 포함)
         ocr_engine_for_log = self.current_ocr_engine_type if image_translation_really_enabled and self.ocr_handler else '사용 안 함'
         ocr_temp_for_log = ocr_temperature_to_use if image_translation_really_enabled else 'N/A'
-        ocr_gpu_for_log = self.ocr_use_gpu_var.get() if image_translation_really_enabled and self.ocr_handler and hasattr(self.ocr_handler, 'use_gpu') and self.ocr_handler.use_gpu else 'N/A'
+        ocr_gpu_for_log = 'N/A'
+        if image_translation_really_enabled and self.ocr_handler and hasattr(self.ocr_handler, 'use_gpu'):
+            ocr_gpu_for_log = self.ocr_handler.use_gpu # 실제 핸들러의 GPU 사용 여부
 
         logger.info(f"번역 시작: '{original_filename}' ({src_lang} -> {tgt_lang}) using {model}. "
                     f"이미지 번역: {'활성' if image_translation_really_enabled else '비활성'}, "
-                    f"OCR 엔진: {ocr_engine_for_log}, OCR 온도: {ocr_temp_for_log}, OCR GPU: {ocr_gpu_for_log}")
+                    f"OCR 엔진: {ocr_engine_for_log}, OCR 온도: {ocr_temp_for_log}, OCR GPU (실제 사용): {ocr_gpu_for_log}")
 
+        # UI 상태 변경 및 스레드 시작
         self.start_button.config(state=tk.DISABLED)
         self.stop_button.config(state=tk.NORMAL)
         self.progress_bar["value"] = 0
         self.progress_label_var.set("0%")
-        self.translated_file_path_var.set("")
+        self.translated_file_path_var.set("") # 이전 결과 초기화
         self.open_folder_button.config(state=tk.DISABLED)
-        self.current_weighted_done = 0
-        self.stop_event.clear()
+        self.current_weighted_done = 0 # 누적 진행량 초기화
+        self.last_reported_progress_percent = 0.0 # 3단계: UI 업데이트 제어용 변수 초기화
+        self.last_progress_update_time = 0.0      # 3단계: UI 업데이트 제어용 변수 초기화
+
+        self.stop_event.clear() # 중지 이벤트 초기화
 
         if self.translation_thread and self.translation_thread.is_alive():
             logger.warning("이미 번역 스레드가 실행 중입니다.")
             messagebox.showwarning("번역 중복", "이미 다른 번역 작업이 진행 중입니다.")
-            self.start_button.config(state=tk.NORMAL)
+            self.start_button.config(state=tk.NORMAL) # 버튼 상태 복원
             self.stop_button.config(state=tk.DISABLED)
             return
 
@@ -1101,64 +1057,88 @@ class Application(tk.Frame):
                                                    args=(file_path, src_lang, tgt_lang, model, task_log_filepath,
                                                          image_translation_really_enabled, ocr_temperature_to_use),
                                                    daemon=True)
-        self.start_time = time.time()
+        self.start_time = time.time() # 번역 시작 시간 기록
         self.translation_thread.start()
-        self.update_progress_timer()
+        self.update_progress_timer() # 주기적 UI 업데이트 타이머 시작 (선택적)
 
 
     def _translation_worker(self, file_path, src_lang, tgt_lang, model, task_log_filepath,
                             image_translation_enabled: bool, ocr_temperature: float):
-        output_path, translation_result_status = "", "실패"
-        prs = None
-        temp_dir_for_pptx_handler_main = None # 여기에 초기화
+        output_path: Optional[str] = None
+        translation_result_status = "실패"
+        prs: Optional[Presentation] = None
+        temp_dir_for_pptx_handler_main: Optional[str] = None
 
         try:
-            with open(task_log_filepath, 'a', encoding='utf-8') as f_log_init:
-                f_log_init.write(f"--- 번역 작업 시작 ({datetime.now().strftime('%Y-%m-%d %H:%M:%S')}) ---\n")
-                f_log_init.write(f"원본 파일: {os.path.basename(file_path)}\n")
-                f_log_init.write(f"원본 언어: {src_lang}, 대상 언어: {tgt_lang}, 번역 모델: {model}\n")
-                f_log_init.write(f"이미지 번역 활성화: {image_translation_enabled}\n")
-                if image_translation_enabled:
-                    f_log_init.write(f"  OCR 엔진: {self.current_ocr_engine_type or '미지정'}\n")
-                    f_log_init.write(f"  OCR 번역 온도: {ocr_temperature}\n")
-                    gpu_in_use_log = 'N/A'
-                    if self.ocr_handler and hasattr(self.ocr_handler, 'use_gpu'): gpu_in_use_log = self.ocr_handler.use_gpu
-                    f_log_init.write(f"  OCR GPU 사용 (실제): {gpu_in_use_log}\n")
-                f_log_init.write(f"총 예상 가중 작업량: {self.total_weighted_work}\n")
-                f_log_init.write("-" * 30 + "\n")
-        except Exception as e_log_header: logger.error(f"작업 로그 파일 헤더 작성 실패: {e_log_header}")
+            # --- 3단계: 공통 유틸리티 함수/클래스 추출 (task_log_filepath 사용) ---
+            # 작업 로그 파일 헤더 작성 (utils.setup_task_logging은 chart_xml_handler에서 사용)
+            # main의 _translation_worker는 전체 흐름을 관장하므로, 여기서 직접 로그 파일에 초기 정보 기록
+            initial_log_messages = [
+                f"--- 번역 작업 시작 ({datetime.now().strftime('%Y-%m-%d %H:%M:%S')}) ---",
+                f"원본 파일: {os.path.basename(file_path)}",
+                f"원본 언어: {src_lang}, 대상 언어: {tgt_lang}, 번역 모델: {model}",
+                f"이미지 번역 활성화: {image_translation_enabled}"
+            ]
+            if image_translation_enabled and self.ocr_handler:
+                initial_log_messages.append(f"  OCR 엔진: {self.current_ocr_engine_type or '미지정'}")
+                initial_log_messages.append(f"  OCR 번역 온도: {ocr_temperature}")
+                gpu_in_use_log = self.ocr_handler.use_gpu if hasattr(self.ocr_handler, 'use_gpu') else 'N/A'
+                initial_log_messages.append(f"  OCR GPU 사용 (실제): {gpu_in_use_log}")
+            elif image_translation_enabled and not self.ocr_handler:
+                initial_log_messages.append(f"  OCR 엔진: 사용 불가 (핸들러 준비 안됨)")
+            initial_log_messages.append(f"총 예상 가중 작업량: {self.total_weighted_work}")
+            initial_log_messages.append("-" * 30)
 
-        def report_item_completed_from_handler(slide_info_or_stage: Any, item_type_str: str, weighted_work_for_item: int, text_snippet_str: str):
-            if self.stop_event.is_set(): return
-            self.current_weighted_done += weighted_work_for_item
-            self.current_weighted_done = min(self.current_weighted_done, self.total_weighted_work if self.total_weighted_work > 0 else weighted_work_for_item)
-            if hasattr(self, 'master') and self.master.winfo_exists():
-                self.master.after(0, self.update_translation_progress, slide_info_or_stage, item_type_str, self.current_weighted_done, self.total_weighted_work, text_snippet_str)
-        try:
+            # utils.setup_task_logging을 사용하지 않고 직접 파일에 기록 (더 유연한 제어 가능)
+            try:
+                with open(task_log_filepath, 'a', encoding='utf-8') as f_log_init:
+                    for line in initial_log_messages:
+                        f_log_init.write(line + "\n")
+                    f_log_init.flush()
+            except Exception as e_log_header:
+                logger.error(f"작업 로그 파일 헤더 작성 실패 ({task_log_filepath}): {e_log_header}")
+
+
+            # --- 3단계: UI 반응성 개선 (진행 상황 콜백 호출 형식) ---
+            def report_item_completed_from_handler(slide_info_or_stage: Any, item_type_str: str, weighted_work_for_item: int, text_snippet_str: str):
+                if self.stop_event.is_set(): return
+                self.current_weighted_done += weighted_work_for_item
+                self.current_weighted_done = min(self.current_weighted_done, self.total_weighted_work if self.total_weighted_work > 0 else weighted_work_for_item)
+                if hasattr(self, 'master') and self.master.winfo_exists():
+                    self.master.after(0, self.update_translation_progress,
+                                      slide_info_or_stage, item_type_str,
+                                      self.current_weighted_done, self.total_weighted_work,
+                                      text_snippet_str)
             if self.total_weighted_work == 0:
-                logger.warning("번역할 가중 작업량이 없습니다.")
+                logger.warning("번역할 가중 작업량이 없습니다 (파일 내용 부재 또는 분석 오류).")
                 if hasattr(self, 'master') and self.master.winfo_exists() and not self.stop_event.is_set():
                      self.master.after(0, lambda: messagebox.showinfo("정보", "파일에 번역할 내용이 없습니다."))
                 translation_result_status, output_path = "내용 없음", file_path
-                with open(task_log_filepath, 'a', encoding='utf-8') as f_log_empty: f_log_empty.write(f"번역할 내용 없음. 원본 파일: {file_path}\n")
+                try:
+                    with open(task_log_filepath, 'a', encoding='utf-8') as f_log_empty:
+                        f_log_empty.write(f"번역할 내용 없음. 원본 파일: {file_path}\n")
+                except Exception as e_log_empty_write: logger.error(f"내용 없음 로그 기록 실패: {e_log_empty_write}")
+
             else:
                 font_code_for_render = config.UI_LANG_TO_FONT_CODE_MAP.get(tgt_lang, 'en')
                 if hasattr(self, 'master') and self.master.winfo_exists():
                     self.master.after(0, lambda: self.current_work_label.config(text="파일 로드 중..."))
                     self.master.update_idletasks()
 
-                temp_dir_for_pptx_handler_main = tempfile.mkdtemp(prefix="pptx_trans_main_") # 여기서 할당
+                temp_dir_for_pptx_handler_main = tempfile.mkdtemp(prefix="pptx_trans_main_")
                 temp_pptx_for_chart_translation_path: Optional[str] = None
 
                 try:
                     prs = Presentation(file_path)
-                    if hasattr(self, 'master') and self.master.winfo_exists(): self.master.after(0, lambda: self.current_work_label.config(text="1단계 (텍스트/이미지) 처리 시작..."))
+                    if hasattr(self, 'master') and self.master.winfo_exists():
+                        self.master.after(0, lambda: self.current_work_label.config(text="1단계 (텍스트/이미지) 처리 시작..."))
 
                     stage1_success = self.pptx_handler.translate_presentation_stage1(
                         prs, src_lang, tgt_lang, self.translator,
                         self.ocr_handler if image_translation_enabled else None,
                         model, self.ollama_service, font_code_for_render, task_log_filepath,
-                        report_item_completed_from_handler, self.stop_event,
+                        report_item_completed_from_handler,
+                        self.stop_event,
                         image_translation_enabled, ocr_temperature
                     )
 
@@ -1170,79 +1150,136 @@ class Application(tk.Frame):
                             if prs: prs.save(stopped_filename_s1)
                             output_path = stopped_filename_s1
                             logger.info(f"1단계 중단, 부분 저장: {output_path}")
-                        except Exception as e_save_stop: logger.error(f"1단계 중단 후 저장 실패: {e_save_stop}"); output_path = file_path
+                        except Exception as e_save_stop:
+                            logger.error(f"1단계 중단 후 저장 실패: {e_save_stop}")
+                            output_path = file_path
                     elif not stage1_success:
-                        logger.error("1단계 번역 실패."); translation_result_status = "실패 (1단계 오류)"; output_path = file_path
+                        logger.error("1단계 번역 실패 (PptxHandler 반환값 False).")
+                        translation_result_status = "실패 (1단계 오류)"
+                        output_path = file_path
                     else:
-                        logger.info("번역 작업자: 1단계 완료. 임시 파일 저장 시도.")
-                        if hasattr(self, 'master') and self.master.winfo_exists(): self.master.after(0, lambda: self.current_work_label.config(text="1단계 완료. 임시 파일 저장 중...")); self.master.update_idletasks()
-                        temp_pptx_for_chart_translation_path = os.path.join(temp_dir_for_pptx_handler_main, f"{os.path.splitext(os.path.basename(file_path))[0]}_temp_for_charts.pptx")
+                        logger.info("번역 작업자: 1단계 (텍스트/이미지) 완료. 임시 파일 저장 시도.")
+                        if hasattr(self, 'master') and self.master.winfo_exists():
+                            self.master.after(0, lambda: self.current_work_label.config(text="1단계 완료. 차트 처리 준비 중..."))
+                            self.master.update_idletasks()
+
+                        temp_pptx_for_chart_translation_path = os.path.join(
+                            temp_dir_for_pptx_handler_main,
+                            f"{os.path.splitext(os.path.basename(file_path))[0]}_temp_for_charts.pptx"
+                        )
                         if prs: prs.save(temp_pptx_for_chart_translation_path)
-                        logger.info(f"1단계 결과 임시 저장: {temp_pptx_for_chart_translation_path}")
+                        logger.info(f"1단계 결과 임시 저장 (차트 처리용): {temp_pptx_for_chart_translation_path}")
+
                         info_for_charts = self.pptx_handler.get_file_info(temp_pptx_for_chart_translation_path)
-                        num_charts_in_prs = info_for_charts.get('chart_elements_count', 0)
+                        num_charts_in_prs = info_for_charts.get('chart_elements_count', 0) # 여기서 num_charts_in_prs 할당
 
                         if num_charts_in_prs > 0 and not self.stop_event.is_set():
-                            if hasattr(self, 'master') and self.master.winfo_exists(): self.master.after(0, lambda: self.current_work_label.config(text=f"2단계 (차트) 처리 시작 ({num_charts_in_prs}개)...")); self.master.update_idletasks()
+                            if hasattr(self, 'master') and self.master.winfo_exists():
+                                self.master.after(0, lambda: self.current_work_label.config(text=f"2단계 (차트) 처리 시작 ({num_charts_in_prs}개)..."))
+                                self.master.update_idletasks()
                             logger.info(f"번역 작업자: 2단계 (차트) 시작. 대상 차트 수: {num_charts_in_prs}")
+
                             safe_target_lang_suffix = "".join(c if c.isalnum() else "_" for c in tgt_lang)
                             final_output_filename_base = f"{os.path.splitext(os.path.basename(file_path))[0]}_{safe_target_lang_suffix}_translated.pptx"
                             final_output_dir = os.path.dirname(file_path)
                             final_pptx_output_path = os.path.join(final_output_dir, final_output_filename_base)
-                            if hasattr(self, 'master') and self.master.winfo_exists(): self.master.after(0, lambda: self.current_work_label.config(text="2단계: 차트 XML 압축 해제 중...")); self.master.update_idletasks()
+
                             output_path_charts = self.chart_xml_handler.translate_charts_in_pptx(
-                                pptx_path=temp_pptx_for_chart_translation_path, src_lang_ui_name=src_lang, tgt_lang_ui_name=tgt_lang, model_name=model,
-                                output_path=final_pptx_output_path, progress_callback_item_completed=report_item_completed_from_handler,
-                                stop_event=self.stop_event, task_log_filepath=task_log_filepath
+                                pptx_path=temp_pptx_for_chart_translation_path,
+                                src_lang_ui_name=src_lang, tgt_lang_ui_name=tgt_lang, model_name=model,
+                                output_path=final_pptx_output_path,
+                                progress_callback_item_completed=report_item_completed_from_handler,
+                                stop_event=self.stop_event,
+                                task_log_filepath=task_log_filepath
                             )
-                            if hasattr(self, 'master') and self.master.winfo_exists(): self.master.after(0, lambda: self.current_work_label.config(text="2단계: 번역된 차트 XML 압축 중...")); self.master.update_idletasks()
+
                             if self.stop_event.is_set():
-                                logger.warning("2단계 차트 번역 중 또는 완료 직후 중지됨."); translation_result_status = "부분 성공 (중지)"
+                                logger.warning("2단계 차트 번역 중 또는 완료 직후 중지됨.")
+                                translation_result_status = "부분 성공 (중지)"
                                 output_path = output_path_charts if (output_path_charts and os.path.exists(output_path_charts)) else temp_pptx_for_chart_translation_path
                             elif output_path_charts and os.path.exists(output_path_charts):
-                                logger.info(f"2단계 차트 번역 완료. 최종 파일: {output_path_charts}"); translation_result_status = "성공"; output_path = output_path_charts
+                                logger.info(f"2단계 차트 번역 완료. 최종 파일: {output_path_charts}")
+                                translation_result_status = "성공"
+                                output_path = output_path_charts
                             else:
-                                logger.error("2단계 차트 번역 실패 또는 결과 파일 없음. 1단계 결과물 사용 시도."); translation_result_status = "실패 (2단계 오류)"
+                                logger.error("2단계 차트 번역 실패 또는 결과 파일 없음. 1단계 결과물 사용 시도.")
+                                translation_result_status = "실패 (2단계 오류)"
                                 if temp_pptx_for_chart_translation_path and os.path.exists(temp_pptx_for_chart_translation_path):
-                                    try: shutil.copy2(temp_pptx_for_chart_translation_path, final_pptx_output_path); output_path = final_pptx_output_path; logger.info(f"차트 번역 실패로 1단계 결과물을 최종 경로에 복사: {output_path}")
-                                    except Exception as e_copy_fallback: logger.error(f"차트 번역 실패 후 1단계 결과물 복사 중 오류: {e_copy_fallback}."); output_path = temp_pptx_for_chart_translation_path
-                                else: output_path = file_path
+                                    try:
+                                        shutil.copy2(temp_pptx_for_chart_translation_path, final_pptx_output_path)
+                                        output_path = final_pptx_output_path
+                                        logger.info(f"차트 번역 실패로 1단계 결과물을 최종 경로에 복사: {output_path}")
+                                    except Exception as e_copy_fallback:
+                                        logger.error(f"차트 번역 실패 후 1단계 결과물 복사 중 오류: {e_copy_fallback}.")
+                                        output_path = temp_pptx_for_chart_translation_path
+                                else:
+                                    output_path = file_path
                         elif self.stop_event.is_set():
-                            logger.info("1단계 후 중단되어 차트 번역은 실행되지 않음."); translation_result_status = "부분 성공 (중지)"; output_path = temp_pptx_for_chart_translation_path
+                            logger.info("1단계 후 중단되어 차트 번역은 실행되지 않음.")
+                            translation_result_status = "부분 성공 (중지)"
+                            output_path = temp_pptx_for_chart_translation_path
                         else:
                             logger.info("번역할 차트가 없습니다. 1단계 결과물을 최종 결과로 사용합니다.")
-                            if hasattr(self, 'master') and self.master.winfo_exists(): self.master.after(0, lambda: self.current_work_label.config(text="최종 파일 저장 중...")); self.master.update_idletasks()
+                            if hasattr(self, 'master') and self.master.winfo_exists():
+                                self.master.after(0, lambda: self.current_work_label.config(text="최종 파일 저장 중..."))
+                                self.master.update_idletasks()
+
                             safe_target_lang_suffix = "".join(c if c.isalnum() else "_" for c in tgt_lang)
                             final_output_filename_base = f"{os.path.splitext(os.path.basename(file_path))[0]}_{safe_target_lang_suffix}_translated.pptx"
                             final_output_dir = os.path.dirname(file_path)
                             final_pptx_output_path = os.path.join(final_output_dir, final_output_filename_base)
                             try:
                                 if temp_pptx_for_chart_translation_path and os.path.exists(temp_pptx_for_chart_translation_path):
-                                    shutil.copy2(temp_pptx_for_chart_translation_path, final_pptx_output_path); output_path = final_pptx_output_path; translation_result_status = "성공"; logger.info(f"차트 없음. 최종 파일 저장: {output_path}")
-                                else: logger.error("차트가 없고, 1단계 임시 파일도 찾을 수 없습니다."); translation_result_status = "실패 (파일 오류)"; output_path = file_path
-                            except Exception as e_copy_no_chart: logger.error(f"차트 없는 경우 최종 파일 복사 중 오류: {e_copy_no_chart}"); translation_result_status = "실패 (파일 복사 오류)"; output_path = temp_pptx_for_chart_translation_path if temp_pptx_for_chart_translation_path else file_path
+                                    shutil.copy2(temp_pptx_for_chart_translation_path, final_pptx_output_path)
+                                    output_path = final_pptx_output_path
+                                    translation_result_status = "성공"
+                                    logger.info(f"차트 없음. 최종 파일 저장: {output_path}")
+                                else:
+                                    logger.error("차트가 없고, 1단계 임시 파일도 찾을 수 없습니다.")
+                                    translation_result_status = "실패 (파일 오류)"
+                                    output_path = file_path
+                            except Exception as e_copy_no_chart:
+                                logger.error(f"차트 없는 경우 최종 파일 복사 중 오류: {e_copy_no_chart}")
+                                translation_result_status = "실패 (파일 복사 오류)"
+                                output_path = temp_pptx_for_chart_translation_path if temp_pptx_for_chart_translation_path and os.path.exists(temp_pptx_for_chart_translation_path) else file_path
                 finally:
-                    if temp_dir_for_pptx_handler_main and os.path.exists(temp_dir_for_pptx_handler_main): # finally 블록 전에 temp_dir_for_pptx_handler_main이 할당되었는지 확인
-                        try: shutil.rmtree(temp_dir_for_pptx_handler_main); logger.debug(f"메인 임시 디렉토리 '{temp_dir_for_pptx_handler_main}' 삭제 완료.")
-                        except Exception as e_clean_main_dir: logger.warning(f"메인 임시 디렉토리 '{temp_dir_for_pptx_handler_main}' 삭제 중 오류: {e_clean_main_dir}")
+                    if temp_dir_for_pptx_handler_main and os.path.exists(temp_dir_for_pptx_handler_main):
+                        try:
+                            shutil.rmtree(temp_dir_for_pptx_handler_main)
+                            logger.debug(f"메인 임시 디렉토리 '{temp_dir_for_pptx_handler_main}' 삭제 완료.")
+                        except Exception as e_clean_main_dir:
+                            logger.warning(f"메인 임시 디렉토리 '{temp_dir_for_pptx_handler_main}' 삭제 중 오류: {e_clean_main_dir}")
 
             if translation_result_status == "성공" and not self.stop_event.is_set():
                  self.current_weighted_done = self.total_weighted_work
-                 if hasattr(self, 'master') and self.master.winfo_exists(): self.master.after(0, self.update_translation_progress, "완료", "번역 완료됨", self.current_weighted_done, self.total_weighted_work, "최종 저장 완료")
+                 if hasattr(self, 'master') and self.master.winfo_exists():
+                     self.master.after(0, self._force_update_translation_progress,
+                                      "완료", "번역 완료됨",
+                                      self.current_weighted_done, self.total_weighted_work,
+                                      "최종 저장 완료")
                  if not (output_path and os.path.exists(output_path)):
-                     logger.error(f"번역 '성공'으로 기록되었으나, 최종 결과 파일({output_path})을 찾을 수 없습니다."); translation_result_status = "실패 (결과 파일 없음)"; output_path = file_path
+                     logger.error(f"번역 '성공'으로 기록되었으나, 최종 결과 파일({output_path})을 찾을 수 없습니다.")
+                     translation_result_status = "실패 (결과 파일 없음)"
+                     output_path = file_path
                  else:
-                    if hasattr(self, 'master') and self.master.winfo_exists(): self.master.after(100, lambda: self._ask_open_folder(output_path))
+                    if hasattr(self, 'master') and self.master.winfo_exists():
+                        self.master.after(100, lambda: self._ask_open_folder(output_path))
             elif "실패" in translation_result_status or "오류" in translation_result_status:
-                 if hasattr(self, 'master') and self.master.winfo_exists(): self.master.after(0, self._handle_translation_failure, translation_result_status, file_path, task_log_filepath)
+                 if hasattr(self, 'master') and self.master.winfo_exists():
+                     self.master.after(0, self._handle_translation_failure, translation_result_status, file_path, task_log_filepath)
                  if not output_path: output_path = file_path
+
         except Exception as e_worker:
             logger.error(f"번역 작업 중 심각한 오류 발생: {e_worker}", exc_info=True)
-            translation_result_status = "치명적 오류 발생"; output_path = output_path or file_path
+            translation_result_status = "치명적 오류 발생"
+            output_path = output_path or file_path
             try:
-                with open(task_log_filepath, 'a', encoding='utf-8') as f_err: f_err.write(f"\n--- 번역 작업 중 심각한 오류 발생 ---\n오류: {e_worker}\n{traceback.format_exc()}");
-            except Exception as ef_log: logger.error(f"작업 로그 파일에 오류 기록 실패: {ef_log}")
-            if hasattr(self, 'master') and self.master.winfo_exists(): self.master.after(0, self._handle_translation_failure, translation_result_status, file_path, task_log_filepath, str(e_worker))
+                with open(task_log_filepath, 'a', encoding='utf-8') as f_err:
+                    f_err.write(f"\n--- 번역 작업 중 심각한 오류 발생 ---\n오류: {e_worker}\n{traceback.format_exc()}");
+            except Exception as ef_log:
+                logger.error(f"작업 로그 파일에 오류 기록 실패: {ef_log}")
+            if hasattr(self, 'master') and self.master.winfo_exists():
+                self.master.after(0, self._handle_translation_failure, translation_result_status, file_path, task_log_filepath, str(e_worker))
         finally:
             if hasattr(self, 'master') and self.master.winfo_exists():
                 history_entry = {
@@ -1250,64 +1287,123 @@ class Application(tk.Frame):
                     "ocr_temp": ocr_temperature if image_translation_enabled else "N/A",
                     "ocr_gpu": self.ocr_use_gpu_var.get() if image_translation_enabled and self.ocr_handler and hasattr(self.ocr_handler, 'use_gpu') else "N/A",
                     "img_trans_enabled": image_translation_enabled, "status": translation_result_status,
-                    "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "path": output_path or file_path,
+                    "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "path": output_path or file_path,
                     "log_file": task_log_filepath
                 }
                 self.master.after(0, self.translation_finished, history_entry)
             self.translation_thread = None
 
+    def _force_update_translation_progress(self, current_location_info: Any, current_task_type: str,
+                                      current_total_weighted_done: int, total_weighted_overall: int,
+                                      current_text_snippet: str = ""):
+        """ UI 업데이트 조건(시간, 변화량)을 무시하고 강제로 진행률을 업데이트합니다. (3단계 추가) """
+        # 이 함수는 _update_ui_progress를 직접 호출하여 UI를 즉시 업데이트
+        if hasattr(self, 'master') and self.master.winfo_exists():
+            self.master.after(0, self._update_ui_progress,
+                              current_location_info, current_task_type,
+                              current_total_weighted_done, total_weighted_overall,
+                              current_text_snippet)
 
-    def _handle_translation_failure(self, status, original_file, log_file, error_details=""):
+    def _update_ui_progress(self, current_location_info: Any, current_task_type: str,
+                           current_total_weighted_done: int, total_weighted_overall: int,
+                           current_text_snippet: str = ""):
+        """실제 UI를 업데이트하는 내부 함수입니다. (3단계 추가 또는 기존 update_translation_progress에서 분리)"""
+        if self.stop_event.is_set() or not (hasattr(self, 'progress_bar') and self.progress_bar.winfo_exists()):
+            return
+
+        progress = 0
+        if total_weighted_overall > 0:
+            progress = (current_total_weighted_done / total_weighted_overall) * 100
+        elif current_total_weighted_done == 0 and total_weighted_overall == 0 : # 작업량 0일 때 완료로 간주
+            progress = 100 # 이 경우에도 100%로 표시
+        progress = min(max(0, progress), 100) # 0~100% 범위 보장
+        progress_text_val = f"{progress:.1f}%"
+
+        # --- 3단계: UI 피드백 구체화 ---
+        # PptxHandler, ChartXmlHandler 등에서 전달된 구체적인 작업 타입과 위치 정보를 사용
+        task_description = current_task_type
+        location_display_text = str(current_location_info) # 예: "슬라이드 5", "차트 제목 번역" 등
+
+        snippet_display = current_text_snippet.replace('\n', ' ').strip()
+        if len(snippet_display) > 30: # UI에 표시될 텍스트 길이 제한
+            snippet_display = snippet_display[:27] + "..."
+
+        # UI 업데이트
+        self.progress_bar["value"] = progress
+        self.progress_label_var.set(progress_text_val)
+        self.current_slide_label.config(text=f"현재 위치: {location_display_text}")
+        self.current_work_label.config(text=f"현재 작업: {task_description} - '{snippet_display}'")
+
+        self.last_reported_progress_percent = progress # 마지막으로 UI에 보고된 진행률 업데이트
+
+
+
+    def _ask_open_folder(self, path: Optional[str]): # 3단계: _translation_worker에서 분리 (새 메서드)
+        """번역 완료 후 사용자에게 폴더 열기 여부를 묻는 메서드입니다."""
+        if path and os.path.exists(path):
+            user_choice = messagebox.askyesnocancel(
+                "번역 완료",
+                f"번역이 완료되었습니다.\n저장된 파일: {os.path.basename(path)}\n\n결과 파일이 저장된 폴더를 여시겠습니까?",
+                icon='info', default=messagebox.YES
+            )
+            if user_choice is True: # Yes
+                utils.open_folder(os.path.dirname(path))
+            # No 또는 Cancel은 아무 작업 안 함
+        elif path: # 경로가 있지만 존재하지 않는 경우 (이론상 발생하면 안됨)
+            logger.warning(f"_ask_open_folder 호출되었으나 파일 경로({path})가 존재하지 않음.")
+            messagebox.showwarning("파일 오류", f"번역된 파일을 찾을 수 없습니다: {path}")
+        # 경로가 없는 경우는 translation_finished에서 이미 처리하므로 여기서는 무시
+
+    def _handle_translation_failure(self, status: str, original_file: str, log_file: str, error_details: str = ""): # 3단계: _translation_worker에서 분리 (새 메서드)
+        """번역 실패 시 사용자에게 알림을 표시하는 메서드입니다."""
         logger.error(f"번역 실패: {status}, 원본: {original_file}, 로그: {log_file}, 상세: {error_details}")
         if hasattr(self, 'current_work_label') and self.current_work_label.winfo_exists():
             self.current_work_label.config(text=f"번역 실패: {status}")
+
         error_title = f"번역 작업 실패 ({status})"
         user_message = f"'{os.path.basename(original_file)}' 파일 번역 중 오류가 발생했습니다.\n\n상태: {status}\n"
-        if error_details: user_message += f"오류 정보: {error_details[:200]}...\n\n"
+        if error_details:
+            user_message += f"오류 정보: {error_details[:200]}...\n\n" # 너무 길면 잘라서 표시
         user_message += "다음 사항을 확인해 보세요:\n- Ollama 서버가 정상적으로 실행 중인지 ('Ollama 확인' 버튼)\n- 선택한 번역 모델이 유효한지 (모델 목록 '🔄' 버튼)\n- 원본 파일이 손상되지 않았는지\n"
         if "GPU" in status.upper() or "CUDA" in status.upper() or "메모리 부족" in status or \
-           (self.ocr_use_gpu_var.get() and ("OCR" in status.upper() or "엔진" in status)):
+           (self.ocr_use_gpu_var.get() and ("OCR" in status.upper() or "엔진" in status.upper())): # 대소문자 구분 없이 GPU/엔진 관련 오류 감지
             user_message += "- 고급 옵션에서 'GPU 사용'을 해제하고 다시 시도해보세요.\n"
         user_message += f"\n자세한 내용은 로그 파일에서 확인할 수 있습니다.\n로그 파일: {log_file}"
+
         if messagebox.askyesno(error_title, user_message + "\n\n오류 로그가 저장된 폴더를 여시겠습니까?", icon='error'):
-            try: utils.open_folder(os.path.dirname(log_file))
-            except Exception as e_open_log_dir: logger.warning(f"로그 폴더 열기 실패: {e_open_log_dir}"); messagebox.showinfo("정보", f"로그 폴더를 열 수 없습니다.\n경로: {os.path.dirname(log_file)}")
-
-
-    def _ask_open_folder(self, path):
-        if path and os.path.exists(path):
-            user_choice = messagebox.askyesnocancel("번역 완료", f"번역이 완료되었습니다.\n저장된 파일: {os.path.basename(path)}\n\n결과 파일이 저장된 폴더를 여시겠습니까?", icon='info', default=messagebox.YES)
-            if user_choice is True: utils.open_folder(os.path.dirname(path))
-
+            try:
+                utils.open_folder(os.path.dirname(log_file))
+            except Exception as e_open_log_dir:
+                logger.warning(f"로그 폴더 열기 실패: {e_open_log_dir}")
+                messagebox.showinfo("정보", f"로그 폴더를 열 수 없습니다.\n경로: {os.path.dirname(log_file)}")
 
     def update_translation_progress(self, current_location_info: Any, current_task_type: str,
                                     current_total_weighted_done: int, total_weighted_overall: int,
                                     current_text_snippet: str = ""):
-        if self.stop_event.is_set(): return
-        progress = 0
-        if total_weighted_overall > 0: progress = (current_total_weighted_done / total_weighted_overall) * 100
-        elif current_total_weighted_done == 0 and total_weighted_overall == 0 : progress = 100
-        progress = min(max(0, progress), 100); progress_text_val = f"{progress:.1f}%"
-        task_description = current_task_type
-        location_display_text = str(current_location_info)
-        if isinstance(current_location_info, (int, float)):
-            location_display_text = f"슬라이드 {int(current_location_info)} / {self.current_file_slide_count}"
-            if "텍스트" in task_description: task_description = "1단계: 텍스트 요소 번역"
-            elif "이미지" in task_description: task_description = "1단계: 이미지 처리"
-            elif "표" in task_description: task_description = "1단계: 표 내부 텍스트 번역"
-            else: task_description = f"1단계: {task_description}"
-        elif not current_location_info or str(current_location_info).upper() == "N/A":
-            location_display_text = "전체 파일 처리"
-            if "차트" in task_description or "chart" in task_description.lower(): task_description = f"2단계: {task_description}"
-        elif str(current_location_info).lower() == "완료": location_display_text = "모든 슬라이드 완료"; task_description = "번역 완료됨"
-        snippet_display = current_text_snippet.replace('\n', ' ').strip();
-        if len(snippet_display) > 25: snippet_display = snippet_display[:22] + "..."
-        def _update_ui():
-            if not (hasattr(self, 'progress_bar') and self.progress_bar.winfo_exists()): return
-            self.progress_bar["value"] = progress; self.progress_label_var.set(progress_text_val)
-            self.current_slide_label.config(text=f"현재 위치: {location_display_text}")
-            self.current_work_label.config(text=f"현재 작업: {task_description} - '{snippet_display}'")
-        if hasattr(self, 'master') and self.master.winfo_exists(): self.master.after(0, _update_ui)
+        """진행률 업데이트 요청을 처리하고, UI 업데이트 빈도를 제어합니다. (3단계 수정)"""
+        if self.stop_event.is_set() or not (hasattr(self, 'progress_bar') and self.progress_bar.winfo_exists()):
+            return
+
+        # --- 3단계: UI 반응성 개선 (업데이트 빈도 제어) ---
+        now = time.time()
+        current_progress_percent = (current_total_weighted_done / total_weighted_overall) * 100 if total_weighted_overall > 0 else 0
+        progress_diff = abs(current_progress_percent - self.last_reported_progress_percent)
+
+        # 시간 간격 또는 진행률 변화량이 충분할 때, 또는 작업 완료 시에만 UI 업데이트
+        should_update_ui = (now - self.last_progress_update_time >= self.min_progress_update_interval) or \
+                           (progress_diff >= self.progress_update_threshold) or \
+                           (current_total_weighted_done == total_weighted_overall and total_weighted_overall >= 0) # 작업량이 0이어도 완료 시 업데이트
+
+        if should_update_ui:
+            if hasattr(self, 'master') and self.master.winfo_exists():
+                # _update_ui_progress를 직접 호출하거나, after를 통해 메인 스레드에서 호출
+                self.master.after(0, self._update_ui_progress,
+                                  current_location_info, current_task_type,
+                                  current_total_weighted_done, total_weighted_overall,
+                                  current_text_snippet)
+            self.last_progress_update_time = now # 마지막 업데이트 시간 갱신
+            # self.last_reported_progress_percent는 _update_ui_progress 내부에서 갱신
 
 
     def update_progress_timer(self):
@@ -1323,32 +1419,73 @@ class Application(tk.Frame):
             logger.warning("모델 다운로드 중지 요청 중..."); self.stop_event.set(); self.stop_button.config(state=tk.DISABLED)
 
 
-    def translation_finished(self, history_entry: Dict[str, Any]):
-        if not (hasattr(self, 'start_button') and self.start_button.winfo_exists()): return
-        self.start_button.config(state=tk.NORMAL); self.stop_button.config(state=tk.DISABLED)
-        result_status = history_entry.get("status", "알 수 없음"); translated_file_path = history_entry.get("path"); current_progress_val = self.progress_bar["value"]
-        if result_status == "성공" and not self.stop_event.is_set(): final_progress_text = "100%"; self.progress_bar["value"] = 100; self.current_work_label.config(text=f"번역 완료: {os.path.basename(translated_file_path) if translated_file_path else '파일 없음'}"); self.current_slide_label.config(text="모든 작업 완료")
-        elif "중지" in result_status: final_progress_text = f"{current_progress_val:.1f}% (중지됨)"; self.current_work_label.config(text="번역 중지됨.")
-        elif result_status == "내용 없음": final_progress_text = "100% (내용 없음)"; self.progress_bar["value"] = 100; self.current_work_label.config(text="번역할 내용 없음.")
-        else: final_progress_text = f"{current_progress_val:.1f}% ({result_status})"
+    def translation_finished(self, history_entry: Dict[str, Any]): # 3단계: UI 업데이트 로직 단순화 (콜백에서 처리)
+        if not (hasattr(self, 'start_button') and self.start_button.winfo_exists()):
+            logger.warning("translation_finished 호출 시 UI 요소(start_button) 없음. UI 업데이트 건너뜀.")
+            return
+
+        self.start_button.config(state=tk.NORMAL)
+        self.stop_button.config(state=tk.DISABLED)
+
+        result_status = history_entry.get("status", "알 수 없음")
+        translated_file_path = history_entry.get("path")
+        current_progress_val_str = self.progress_label_var.get().replace('%', '')
+        try:
+            current_progress_val = float(current_progress_val_str)
+        except ValueError:
+            current_progress_val = 0.0 # 파싱 실패 시 기본값
+
+        final_progress_text = f"{current_progress_val:.1f}% ({result_status})" # 기본적으로 현재 진행률과 상태 표시
+
+        if result_status == "성공" and not self.stop_event.is_set():
+            # _translation_worker에서 이미 100%로 업데이트했을 것이므로, 여기서는 상태 텍스트만 정리
+            final_progress_text = "100% (완료)"
+            self.current_work_label.config(text=f"번역 완료: {os.path.basename(translated_file_path) if translated_file_path else '파일 없음'}")
+            self.current_slide_label.config(text="모든 작업 완료")
+        elif "중지" in result_status:
+            self.current_work_label.config(text="번역 중지됨.")
+            # final_progress_text는 현재값 유지
+        elif result_status == "내용 없음":
+            final_progress_text = "100% (내용 없음)" # 내용 없어도 100%로
+            self.current_work_label.config(text="번역할 내용 없음.")
+        else: # 실패 또는 기타 오류
+            self.current_work_label.config(text=f"번역 실패: {result_status}")
+            # final_progress_text는 현재값 유지
+
         self.progress_label_var.set(final_progress_text)
-        if translated_file_path and os.path.exists(translated_file_path) and result_status == "성공": self.translated_file_path_var.set(translated_file_path); self.open_folder_button.config(state=tk.NORMAL)
-        else: self.translated_file_path_var.set("번역 실패 또는 파일 없음"); self.open_folder_button.config(state=tk.DISABLED);
-        if result_status == "성공" and not (translated_file_path and os.path.exists(translated_file_path)): logger.warning(f"번역은 '성공'으로 기록되었으나, 결과 파일 경로가 유효하지 않음: {translated_file_path}")
-        self._add_history_entry(history_entry)
+
+        # 번역된 파일 경로 및 폴더 열기 버튼 상태 업데이트
+        if translated_file_path and os.path.exists(translated_file_path) and result_status == "성공":
+            self.translated_file_path_var.set(translated_file_path)
+            self.open_folder_button.config(state=tk.NORMAL)
+        else:
+            self.translated_file_path_var.set("번역 실패 또는 파일 없음")
+            self.open_folder_button.config(state=tk.DISABLED)
+            if result_status == "성공" and not (translated_file_path and os.path.exists(translated_file_path)):
+                logger.warning(f"번역은 '성공'으로 기록되었으나, 결과 파일 경로가 유효하지 않음: {translated_file_path}")
+
+        self._add_history_entry(history_entry) # 히스토리 추가
+
+        # 작업 로그 파일에 최종 상태 기록
         task_log_filepath = history_entry.get("log_file")
-        if task_log_filepath and os.path.exists(os.path.dirname(task_log_filepath)):
+        if task_log_filepath and os.path.exists(os.path.dirname(task_log_filepath)): # 로그 파일 디렉토리 존재 확인
             try:
                 with open(task_log_filepath, 'a', encoding='utf-8') as f_task_log:
                     f_task_log.write(f"\n--- 번역 작업 최종 상태 ({datetime.now().strftime('%Y-%m-%d %H:%M:%S')}) ---\n")
                     f_task_log.write(f"최종 상태: {result_status}\n")
-                    if self.file_path_var.get(): f_task_log.write(f"원본 파일 (UI 경로): {self.file_path_var.get()}\n")
-                    if translated_file_path and os.path.exists(translated_file_path): f_task_log.write(f"번역된 파일: {translated_file_path}\n")
-                    elapsed_time_for_log = (time.time() - self.start_time) if self.start_time else 0; m, s = divmod(elapsed_time_for_log, 60)
-                    f_task_log.write(f"총 소요 시간 (내부 기록용): {int(m):02d}분 {s:05.2f}초\n"); f_task_log.write("-" * 30 + "\n")
-            except Exception as e_log_finish: logger.error(f"작업 로그 파일에 최종 상태 기록 실패: {e_log_finish}")
-        self.start_time = None
+                    if self.file_path_var.get(): # UI에 표시된 원본 파일 경로
+                        f_task_log.write(f"원본 파일 (UI 경로): {self.file_path_var.get()}\n")
+                    if translated_file_path and os.path.exists(translated_file_path):
+                        f_task_log.write(f"번역된 파일: {translated_file_path}\n")
 
+                    elapsed_time_for_log = (time.time() - self.start_time) if self.start_time else 0
+                    m, s = divmod(elapsed_time_for_log, 60)
+                    f_task_log.write(f"총 소요 시간 (내부 기록용): {int(m):02d}분 {s:05.2f}초\n")
+                    f_task_log.write("-" * 30 + "\n")
+            except Exception as e_log_finish:
+                logger.error(f"작업 로그 파일에 최종 상태 기록 실패: {e_log_finish}")
+
+        self.start_time = None # 번역 시작 시간 초기화
 
     def open_translated_folder(self):
         path = self.translated_file_path_var.get()
@@ -1398,37 +1535,69 @@ class TextHandler(logging.Handler):
             if not (self.text_widget and self.text_widget.winfo_exists()): return
             self.text_widget.config(state=tk.NORMAL)
             self.text_widget.insert(tk.END, msg + '\n')
-            self.text_widget.see(tk.END)
+            self.text_widget.see(tk.END) # 자동 스크롤
             self.text_widget.config(state=tk.DISABLED)
         try:
-            if self.text_widget.winfo_exists(): self.text_widget.after(0, append_message)
-        except tk.TclError: pass
+            # Tkinter 위젯 관련 작업은 메인 스레드에서 실행되도록 함
+            if self.text_widget.winfo_exists():
+                self.text_widget.after(0, append_message)
+        except tk.TclError: # 위젯이 파괴된 후 호출될 경우 대비
+            pass
 
 
 if __name__ == "__main__":
+    # 필수 디렉토리 생성
     for dir_path in [LOGS_DIR, FONTS_DIR, ASSETS_DIR, HISTORY_DIR, os.path.dirname(USER_SETTINGS_PATH)]:
         try:
-            if dir_path: os.makedirs(dir_path, exist_ok=True)
-        except Exception as e_mkdir_main: print(f"디렉토리 생성 실패 ({dir_path}): {e_mkdir_main}")
+            if dir_path:
+                os.makedirs(dir_path, exist_ok=True)
+        except Exception as e_mkdir_main:
+            print(f"필수 디렉토리 생성 실패 ({dir_path}): {e_mkdir_main}") # 로거 설정 전일 수 있으므로 print 사용
+            logger.critical(f"필수 디렉토리 생성 실패 ({dir_path}): {e_mkdir_main}", exc_info=True)
 
     if debug_mode: logger.info("디버그 모드로 실행 중입니다.")
     else: logger.info("일반 모드로 실행 중입니다.")
 
+    # 필수 디렉토리 존재 여부 재확인 (로깅용)
     if not os.path.exists(config.FONTS_DIR) or not os.listdir(config.FONTS_DIR):
         logger.critical(f"필수 폰트 디렉토리({config.FONTS_DIR})를 찾을 수 없거나 비어있습니다. 애플리케이션이 정상 동작하지 않을 수 있습니다.")
     else: logger.info(f"폰트 디렉토리 확인: {config.FONTS_DIR}")
-    if not os.path.exists(config.ASSETS_DIR): logger.warning(f"에셋 디렉토리를 찾을 수 없습니다: {config.ASSETS_DIR}")
+
+    if not os.path.exists(config.ASSETS_DIR):
+        logger.warning(f"에셋 디렉토리를 찾을 수 없습니다: {config.ASSETS_DIR}")
     else: logger.info(f"에셋 디렉토리 확인: {config.ASSETS_DIR}")
 
     root = tk.Tk()
-    app = Application(master=root)
-    root.geometry("1024x768")
+
+    # --- 2단계: 의존성 주입 구성 ---
+    # 애플리케이션 시작 지점에서 실제 핸들러 구현체들을 생성
+    ollama_service_instance = OllamaService()
+    translator_instance = OllamaTranslator()
+    pptx_handler_instance = PptxHandler()
+    # ChartXmlHandler는 OllamaTranslator와 OllamaService를 필요로 함
+    chart_processor_instance = ChartXmlHandler(translator_instance, ollama_service_instance)
+    ocr_handler_factory_instance = OcrHandlerFactory() # 실제 팩토리 구현체 사용
+
+    # Application 클래스에 주입
+    app = Application(master=root,
+                      ollama_service=ollama_service_instance,
+                      translator=translator_instance,
+                      pptx_handler=pptx_handler_instance,
+                      chart_processor=chart_processor_instance,
+                      ocr_handler_factory=ocr_handler_factory_instance)
+
+    root.geometry("1024x768") # 기본 창 크기
+    # UI 요소들이 모두 생성된 후 최소 크기 계산 및 설정
     root.update_idletasks()
     min_width = root.winfo_reqwidth()
     min_height = root.winfo_reqheight()
-    root.minsize(min_width + 20, min_height + 20)
+    root.minsize(min_width + 20, min_height + 20) # 여유 공간 추가
 
     try:
         root.mainloop()
-    except KeyboardInterrupt: logger.info("Ctrl+C로 애플리케이션 종료 중...")
-    finally: logger.info(f"--- {APP_NAME} 종료됨 (mainloop 이후) ---")
+    except KeyboardInterrupt:
+        logger.info("Ctrl+C로 애플리케이션 종료 중...")
+    finally:
+        # on_closing이 atexit으로도 등록되어 있으므로, 여기서 중복 호출될 수 있음
+        # on_closing 내부에서 중복 실행 방지 로직이 중요
+        logger.info(f"--- {APP_NAME} 종료됨 (mainloop 이후) ---")

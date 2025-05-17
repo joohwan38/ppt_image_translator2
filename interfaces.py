@@ -40,7 +40,7 @@ class AbsOcrHandler(ABC):
 
     @property
     @abstractmethod
-    def ocr_engine(self) -> Any: # 실제 엔진 객체 타입은 구현체마다 다를 수 있음
+    def ocr_engine(self) -> Any:
         pass
 
     @property
@@ -50,7 +50,7 @@ class AbsOcrHandler(ABC):
 
     @property
     @abstractmethod
-    def current_lang_codes(self) -> Any: # Paddle은 문자열, EasyOCR은 리스트일 수 있음
+    def current_lang_codes(self) -> Any:
         pass
 
 
