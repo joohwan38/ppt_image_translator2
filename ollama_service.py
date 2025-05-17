@@ -8,24 +8,29 @@ import time
 import logging
 import json
 from typing import Tuple, Optional, List
-import threading # stop_event 타입 힌트를 위해 추가
+import threading
+
+# 설정 파일 import
+import config
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_OLLAMA_URL = "http://localhost:11434"
-OLLAMA_CONNECT_TIMEOUT = 5
-OLLAMA_READ_TIMEOUT = 180  # 일반 API 읽기 타임아웃
-OLLAMA_PULL_READ_TIMEOUT = None # 모델 다운로드는 매우 오래 걸릴 수 있어 무제한 또는 매우 길게
+# Ollama URL 및 타임아웃은 config에서 가져옴
+# DEFAULT_OLLAMA_URL = config.DEFAULT_OLLAMA_URL
+# OLLAMA_CONNECT_TIMEOUT = config.OLLAMA_CONNECT_TIMEOUT
+# OLLAMA_READ_TIMEOUT = config.OLLAMA_READ_TIMEOUT
+# OLLAMA_PULL_READ_TIMEOUT = config.OLLAMA_PULL_READ_TIMEOUT
 
 class OllamaService:
-    def __init__(self, url: str = DEFAULT_OLLAMA_URL):
-        self.url = url
-        self.connect_timeout = OLLAMA_CONNECT_TIMEOUT
-        self.read_timeout = OLLAMA_READ_TIMEOUT
-        self.pull_read_timeout = OLLAMA_PULL_READ_TIMEOUT
+    def __init__(self, url: str = None): # config에서 가져오므로 기본값 None 처리
+        self.url = url if url is not None else config.DEFAULT_OLLAMA_URL
+        self.connect_timeout = config.OLLAMA_CONNECT_TIMEOUT
+        self.read_timeout = config.OLLAMA_READ_TIMEOUT
+        self.pull_read_timeout = config.OLLAMA_PULL_READ_TIMEOUT
+        logger.debug(f"OllamaService initialized with URL: {self.url}")
+
 
     def is_installed(self) -> bool:
-        # ... (기존과 동일) ...
         try:
             if shutil.which('ollama'):
                 logger.debug("Ollama found in PATH via shutil.which")
@@ -69,7 +74,6 @@ class OllamaService:
 
 
     def is_running(self) -> Tuple[bool, Optional[str]]:
-        # ... (기존과 동일) ...
         try:
             response = requests.get(f"{self.url}/api/tags", timeout=self.connect_timeout)
             if response.status_code == 200:
@@ -97,9 +101,9 @@ class OllamaService:
                                 return True, port_from_url
                         except Exception:
                             pass
-                        return True, "11434"
+                        return True, "11434" # Default port if not extractable
         except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-            pass
+            pass # These are expected errors if the process doesn't exist or access is denied.
         except Exception as e:
             logger.error(f"Ollama 상태 확인 중 psutil 오류: {e}", exc_info=True)
         logger.debug("Ollama not detected as running by API or process check.")
@@ -107,7 +111,6 @@ class OllamaService:
 
 
     def start_ollama(self) -> bool:
-        # ... (기존과 동일) ...
         if not self.is_installed():
             logger.warning("Ollama가 설치되어 있지 않아 시작할 수 없습니다.")
             return False
@@ -125,9 +128,12 @@ class OllamaService:
             if platform.system() == "Windows":
                 process_options['creationflags'] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
             else:
-                process_options['start_new_session'] = True
+                process_options['start_new_session'] = True # For Unix-like systems
+            
             subprocess.Popen(cmd, **process_options)
-            for attempt in range(10):
+            
+            # Wait a bit for Ollama to start
+            for attempt in range(10): # Try for up to 10 seconds
                 time.sleep(1)
                 running, _ = self.is_running()
                 if running:
@@ -144,15 +150,15 @@ class OllamaService:
 
 
     def get_text_models(self) -> List[str]:
-        # ... (기존과 동일) ...
         running, _ = self.is_running()
         if not running:
             logger.warning("Ollama가 실행 중이지 않아 모델 목록을 가져올 수 없습니다.")
             return []
+        
         models = []
         try:
             response = requests.get(f"{self.url}/api/tags", timeout=(self.connect_timeout, self.read_timeout))
-            response.raise_for_status()
+            response.raise_for_status() # Raise an exception for HTTP errors
             models_data = response.json()
             if 'models' in models_data and isinstance(models_data['models'], list):
                 models = [model['name'] for model in models_data['models'] if isinstance(model, dict) and 'name' in model]
@@ -162,15 +168,18 @@ class OllamaService:
                 logger.warning(f"Ollama 모델 목록 API 응답 형식이 올바르지 않음: {models_data}")
         except requests.exceptions.RequestException as e:
             logger.warning(f"Ollama 모델 목록 API 요청 중 예외 발생 (CLI 시도): {e}")
-        except json.JSONDecodeError as e:
+        except json.JSONDecodeError as e: # If response is not valid JSON
             logger.warning(f"Ollama 모델 목록 API 응답 JSON 디코딩 오류 (CLI 시도): {e}")
 
-        if self.is_installed():
+        # Fallback to CLI if API fails or returns unexpected format
+        if self.is_installed(): # Check again if installed, as API might fail for other reasons
             try:
                 result = subprocess.run(["ollama", "list"], capture_output=True, text=True, check=False, timeout=15)
                 if result.returncode == 0:
                     lines = result.stdout.strip().split('\n')
-                    if len(lines) > 1:
+                    # Expecting header line, then model lines
+                    if len(lines) > 1: # Header + at least one model
+                        # Assuming the first word of each line (after header) is the model name
                         cli_models = [line.split()[0] for line in lines[1:] if line.strip() and line.split()]
                         logger.debug(f"Ollama 모델 목록 (CLI): {cli_models}")
                         return cli_models
@@ -178,42 +187,46 @@ class OllamaService:
                     logger.warning(f"Ollama list 명령어 실행 실패 (종료 코드: {result.returncode}): {result.stderr.strip()}")
             except subprocess.TimeoutExpired:
                 logger.warning("Ollama list 명령어 실행 시간 초과.")
-            except FileNotFoundError:
+            except FileNotFoundError: # Should have been caught by is_installed, but as a safeguard
                 logger.warning("Ollama 명령어를 찾을 수 없어 CLI로 모델 목록을 가져올 수 없습니다.")
             except Exception as e:
                 logger.error(f"Ollama list 명령어 실행 중 예외 발생: {e}", exc_info=True)
-        if not models:
+        
+        if not models: # If models list is still empty after API and CLI attempts
             logger.warning("Ollama에서 모델 목록을 가져오지 못했습니다.")
         return models
 
 
     def pull_model_with_progress(self, model_name: str,
                                  progress_callback=None,
-                                 stop_event: Optional[threading.Event] = None): # stop_event 파라미터 추가
+                                 stop_event: Optional[threading.Event] = None):
         running, _ = self.is_running()
         if not running:
             logger.warning(f"Ollama 미실행. {model_name} 모델 다운로드 불가.")
             if progress_callback: progress_callback("Ollama 서버 미실행", 0, 0, is_error=True)
             return False
 
-        response = None # finally 블록에서 사용하기 위해 초기화
+        response = None
         try:
             logger.info(f"{model_name} 모델 다운로드 시작...")
             if progress_callback: progress_callback(f"{model_name} 다운로드 시작...", 0, 0)
 
+            # For model pulling, use OLLAMA_PULL_READ_TIMEOUT
+            current_pull_timeout = self.pull_read_timeout
+            
             response = requests.post(
                 f"{self.url}/api/pull",
                 json={"name": model_name, "stream": True},
                 stream=True,
-                timeout=(self.connect_timeout, self.pull_read_timeout)
+                timeout=(self.connect_timeout, current_pull_timeout) # Use specific timeout for pull
             )
             response.raise_for_status()
 
             for line in response.iter_lines():
-                if stop_event and stop_event.is_set(): # 중지 이벤트 확인
+                if stop_event and stop_event.is_set():
                     logger.info(f"{model_name} 모델 다운로드 중지됨 (사용자 요청).")
                     if progress_callback: progress_callback("다운로드 중지됨", 0, 0, is_error=True)
-                    return False # 중지 시 실패로 간주하고 반환
+                    return False
 
                 if line:
                     try:
@@ -230,13 +243,13 @@ class OllamaService:
 
                         if progress_callback:
                             progress_text = status
-                            if total > 0 and "downloading" in status:
+                            if total > 0 and "downloading" in status.lower(): # More robust check
                                 progress_text = f"{status} ({completed/1024/1024:.1f}MB / {total/1024/1024:.1f}MB)"
-                            elif "digest" in data and "completed" in data and "total" in data :
-                                progress_text = f"레이어 다운로드 중... ({completed/1024/1024:.1f}MB / {total/1024/1024:.1f}MB)"
+                            elif "digest" in data and "completed" in data and "total" in data : # For layers
+                                progress_text = f"레이어 처리 중... ({completed/1024/1024:.1f}MB / {total/1024/1024:.1f}MB)"
                             progress_callback(progress_text, completed, total)
 
-                        if status == "success":
+                        if status.lower() == "success": # Case-insensitive check for success
                             logger.info(f"{model_name} 모델 다운로드 성공.")
                             if progress_callback: progress_callback("다운로드 완료", total if total else completed, total if total else completed)
                             return True
@@ -253,18 +266,23 @@ class OllamaService:
             if progress_callback: progress_callback("다운로드 확인 실패", 0, 0, is_error=True)
             return False
 
+        except requests.exceptions.Timeout as e_timeout: # Specific timeout handling
+            error_msg = f"Ollama 모델 다운로드 요청 시간 초과 ({model_name}): {e_timeout}"
+            logger.error(error_msg, exc_info=True)
+            if progress_callback: progress_callback(error_msg, 0, 0, is_error=True)
+            return False
         except requests.exceptions.RequestException as e_req:
             error_msg = f"Ollama 모델 다운로드 요청 오류 ({model_name}): {e_req}"
-            logger.error(error_msg, exc_info=True) # exc_info=True 추가
+            logger.error(error_msg, exc_info=True)
             if progress_callback: progress_callback(error_msg, 0, 0, is_error=True)
             return False
         except Exception as e_pull:
             error_msg = f"Ollama 모델 다운로드 중 예측하지 못한 오류 ({model_name}): {e_pull}"
-            logger.error(error_msg, exc_info=True) # exc_info=True 추가
+            logger.error(error_msg, exc_info=True)
             if progress_callback: progress_callback(error_msg, 0, 0, is_error=True)
             return False
         finally:
-            if response: # 응답 객체가 있다면 명시적으로 닫기
+            if response:
                 try:
                     response.close()
                     logger.debug(f"Ollama pull API 응답 스트림 닫힘 ({model_name}).")
