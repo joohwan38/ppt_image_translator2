@@ -6,6 +6,7 @@ import logging
 import io
 import textwrap
 import math
+from typing import List
 
 # 설정 파일 import
 import config
@@ -119,6 +120,9 @@ class BaseOcrHandler:
                 except Exception: pass
     
     def _get_font(self, font_size, lang_code='en', is_bold=False):
+        # font_size가 0보다 작은 경우를 방지
+        font_size = max(1, int(font_size))
+        # ... (기존 _get_font 내용) ...
         font_filename = None
         font_path = None
 
@@ -137,10 +141,10 @@ class BaseOcrHandler:
         
         if not font_filename:
             font_filename = default_font_filename if not is_bold else default_bold_font_filename
-            logger.warning(f"요청된 폰트 코드 '{lang_code}'(bold:{is_bold})에 대한 폰트 매핑 없음. 기본 폰트 '{font_filename}' 사용.")
+            # logger.warning(f"요청된 폰트 코드 '{lang_code}'(bold:{is_bold})에 대한 폰트 매핑 없음. 기본 폰트 '{font_filename}' 사용.")
 
         if font_filename:
-            font_path = os.path.join(FONT_DIR, font_filename) # config.FONTS_DIR 사용
+            font_path = os.path.join(FONT_DIR, font_filename) 
 
         if font_path and os.path.exists(font_path):
             try:
@@ -150,26 +154,139 @@ class BaseOcrHandler:
             except Exception as e_font:
                 logger.error(f"폰트 로드 중 예기치 않은 오류 ('{font_path}', size:{font_size}): {e_font}. Pillow 기본 폰트로 대체.", exc_info=True)
         else:
-            logger.warning(f"폰트 파일 없음: '{font_path or font_filename}' (요청 코드: {lang_code}, bold: {is_bold}). Pillow 기본 폰트 사용.")
+            # logger.warning(f"폰트 파일 없음: '{font_path or font_filename}' (요청 코드: {lang_code}, bold: {is_bold}). Pillow 기본 폰트 사용.")
+            pass # 로깅 너무 많을 수 있어 주석 처리
         
         try:
-            if PILLOW_VERSION_TUPLE >= (9, 0, 0):
+            # Pillow 10.0.0 부터 load_default() 에 size 인자 없음
+            if PILLOW_VERSION_TUPLE >= (10, 0, 0):
                  return ImageFont.load_default()
-            else:
-                 return ImageFont.load_default(size=int(font_size))
-        except TypeError:
-            return ImageFont.load_default()
+            elif PILLOW_VERSION_TUPLE >= (9, 0, 0): # Pillow 9.x.x 버전과의 호환성
+                 return ImageFont.load_default(size=int(font_size)) # size 인자 있는 경우
+            else: # 그 이전 버전
+                 return ImageFont.load_default() # size 인자 없는 경우
+        except TypeError: # load_default에 size 인자가 없거나 있는 경우의 TypeError 처리
+            try:
+                return ImageFont.load_default() # 인자 없이 다시 시도
+            except Exception as e_default_font_fallback:
+                logger.critical(f"Pillow 기본 폰트 로드조차 실패 (size={font_size}): {e_default_font_fallback}. 글꼴 렌더링 불가.", exc_info=True)
+                raise RuntimeError(f"기본 폰트 로드 실패: {e_default_font_fallback}")
+
         except Exception as e_default_font:
-            logger.critical(f"Pillow 기본 폰트 로드조차 실패: {e_default_font}. 글꼴 렌더링 불가.", exc_info=True)
+            logger.critical(f"Pillow 기본 폰트 로드 실패 (size={font_size}): {e_default_font}. 글꼴 렌더링 불가.", exc_info=True)
             raise RuntimeError(f"기본 폰트 로드 실패: {e_default_font}")
+
+    def _calculate_text_dimensions(self, draw: ImageDraw.ImageDraw, text: str, font_size: int,
+                                   render_area_width: int, lang_code: str, is_bold: bool, line_spacing: int) -> tuple[int, int, List[str]]:
+        """주어진 폰트 크기로 텍스트를 래핑하고 렌더링될 크기를 계산합니다."""
+        if font_size < 1: font_size = 1 # 폰트 크기는 최소 1
+        current_font = self._get_font(font_size, lang_code=lang_code, is_bold=is_bold)
+        
+        estimated_chars_per_line = 1
+        if render_area_width > 0:
+            try:
+                # Pillow 9.2.0 이상에서 textlength 사용 가능
+                if PILLOW_VERSION_TUPLE >= (9, 2, 0) and hasattr(draw, 'textlength'):
+                    char_w_metric = draw.textlength("W", font=current_font) 
+                    if char_w_metric <= 0: char_w_metric = draw.textlength("가", font=current_font) # 한글 등 다른 문자 시도
+                    if char_w_metric <= 0: char_w_metric = font_size * 0.6 # 최후의 수단
+                else: # 구버전 Pillow 또는 textlength 지원 안될 시
+                    if hasattr(current_font, 'getlength'): # getsize 대신 getlength 사용 (Pillow 8.0.0+)
+                        char_w_metric = current_font.getlength("W")
+                        if char_w_metric <= 0: char_w_metric = current_font.getlength("가")
+                    elif hasattr(current_font, 'getsize'): # 구버전 호환
+                         char_w_metric, _ = current_font.getsize("W")
+                         if char_w_metric <= 0 : char_w_metric, _ = current_font.getsize("가")
+                    else: # getmask().getbbox()는 비효율적이라 최후의 수단
+                        char_w_metric = font_size * 0.6 # 근사치
+                
+                if char_w_metric > 0:
+                    estimated_chars_per_line = max(1, int(render_area_width / char_w_metric))
+                else: # char_w_metric 이 0 이하일 경우 (폰트 문제 등)
+                    estimated_chars_per_line = max(1, int(render_area_width / (font_size * 0.5 + 1)))
+
+
+            except Exception: # 모든 예외 처리
+                estimated_chars_per_line = max(1, int(render_area_width / (font_size * 0.6))) # 보수적인 추정
+
+        wrapper = textwrap.TextWrapper(width=estimated_chars_per_line, break_long_words=True,
+                                       replace_whitespace=False, drop_whitespace=False,
+                                       break_on_hyphens=True)
+        wrapped_lines = wrapper.wrap(text)
+        if not wrapped_lines: wrapped_lines = [" "] # 빈 텍스트도 한 줄로 처리
+
+        rendered_text_height = 0
+        rendered_text_width = 0
+
+        if PILLOW_VERSION_TUPLE >= (9, 2, 0) and hasattr(draw, 'multiline_textbbox'):
+            try:
+                # (0,0) 기준으로 bbox 계산
+                # anchor='lt' (left-top)은 Pillow 9.3.0부터 지원. 이전 버전에서는 사용 불가.
+                # Pillow 버전에 따라 anchor 인자 사용 여부 결정 필요
+                if PILLOW_VERSION_TUPLE >= (9, 3, 0):
+                    text_bbox = draw.multiline_textbbox((0,0), "\n".join(wrapped_lines), font=current_font, spacing=line_spacing, anchor="lt")
+                else: # anchor 미지원 버전
+                    text_bbox = draw.multiline_textbbox((0,0), "\n".join(wrapped_lines), font=current_font, spacing=line_spacing)
+                
+                rendered_text_width = text_bbox[2] - text_bbox[0]
+                rendered_text_height = text_bbox[3] - text_bbox[1]
+            except Exception: # 오류 발생 시 수동 계산으로 fallback
+                max_w_line = 0
+                for line_idx_calc, line_calc in enumerate(wrapped_lines):
+                    if hasattr(draw, 'textbbox'): # Pillow 8.0.0+
+                        if PILLOW_VERSION_TUPLE >= (9, 3, 0):
+                            line_bbox_calc = draw.textbbox((0,0), line_calc, font=current_font, anchor="lt")
+                        else:
+                            line_bbox_calc = draw.textbbox((0,0), line_calc, font=current_font)
+                        line_w = line_bbox_calc[2] - line_bbox_calc[0]
+                        line_h = line_bbox_calc[3] - line_bbox_calc[1]
+                    elif hasattr(current_font, 'getsize'): # 구버전
+                        line_w, line_h = current_font.getsize(line_calc)
+                    else: # 최후의 수단
+                        line_w = len(line_calc) * font_size * 0.6
+                        line_h = font_size
+
+                    rendered_text_height += line_h
+                    if line_w > max_w_line: max_w_line = line_w
+                    if line_idx_calc < len(wrapped_lines) - 1:
+                        rendered_text_height += line_spacing
+                rendered_text_width = max_w_line
+        else: # multiline_textbbox 미지원 시 수동 계산
+            max_w_line = 0
+            for line_idx_calc, line_calc in enumerate(wrapped_lines):
+                if hasattr(current_font, 'getsize'):
+                    line_w, line_h = current_font.getsize(line_calc)
+                else:
+                    try:
+                        # getmask().getbbox() 는 Pillow 10 에서 제거됨. getbbox() 사용.
+                        if hasattr(current_font, 'getbbox'):
+                            # getbbox는 (left, top, right, bottom) 튜플 반환. 텍스트 자체의 바운딩 박스.
+                            bbox = current_font.getbbox(line_calc) 
+                            line_w = bbox[2] - bbox[0]
+                            line_h = bbox[3] - bbox[1]
+                        else: # 정말 최후의 수단
+                            line_w = len(line_calc) * font_size * 0.6
+                            line_h = font_size
+                    except Exception:
+                        line_w = len(line_calc) * font_size * 0.6
+                        line_h = font_size
+                
+                rendered_text_height += line_h
+                if line_w > max_w_line: max_w_line = line_w
+                if line_idx_calc < len(wrapped_lines) - 1:
+                    rendered_text_height += line_spacing
+            rendered_text_width = max_w_line
+            
+        return int(rendered_text_width), int(rendered_text_height), wrapped_lines
+
 
     def render_translated_text_on_image(self, image_pil_original, box, translated_text,
                                         font_code_for_render='en', original_text="", ocr_angle=None):
-        # (이하 렌더링 로직은 기존과 동일하게 유지)
         img_to_draw_on = image_pil_original.copy()
         draw = ImageDraw.Draw(img_to_draw_on)
         
         try:
+            # ... (기존 바운딩 박스 계산 로직은 유지) ...
             x_coords = [p[0] for p in box]
             y_coords = [p[1] for p in box]
             min_x, max_x = min(x_coords), max(x_coords)
@@ -217,139 +334,135 @@ class BaseOcrHandler:
         render_area_height = bbox_height_render - 2 * padding_y
 
         if render_area_width <= 1 or render_area_height <= 1:
-            logger.warning(f"텍스트 '{translated_text[:20]}...' 렌더링 영역 너무 작음 (패딩 후). 스킵.")
-            return img_to_draw_on
+            # logger.warning(f"텍스트 '{translated_text[:20]}...' 렌더링 영역 너무 작음 (패딩 후). 스킵.")
+            return img_to_draw_on # 조용히 반환
 
         font_size_correction_factor = 1.0
+        # ... (기존 font_size_correction_factor 계산 로직 유지) ...
         text_angle_deg = 0.0
         if ocr_angle is not None and isinstance(ocr_angle, (int, float)):
             text_angle_deg = abs(ocr_angle)
             if 5 < text_angle_deg < 85 or 95 < text_angle_deg < 175:
                 font_size_correction_factor = max(0.6, 1.0 - (text_angle_deg / 90.0) * 0.3)
-                logger.debug(f"OCR 제공 각도 {ocr_angle:.1f}도. 글꼴 크기 보정 계수: {font_size_correction_factor:.2f}")
+                # logger.debug(f"OCR 제공 각도 {ocr_angle:.1f}도. 글꼴 크기 보정 계수: {font_size_correction_factor:.2f}")
         elif bbox_width_orig > 0 and bbox_height_orig > 0 :
             aspect_ratio_orig = bbox_width_orig / bbox_height_orig
-            if aspect_ratio_orig > 2.0 or aspect_ratio_orig < 0.5:
-                font_size_correction_factor = 0.80
-                logger.debug(f"바운딩 박스 비율 ({aspect_ratio_orig:.2f}) 기반 기울기 의심. 글꼴 크기 보정 계수: {font_size_correction_factor:.2f}")
+            if aspect_ratio_orig > 2.0 or aspect_ratio_orig < 0.5: # 매우 길거나 매우 높은 박스
+                font_size_correction_factor = 0.80 # 글꼴 크기를 약간 줄여서 맞춤
+                # logger.debug(f"바운딩 박스 비율 ({aspect_ratio_orig:.2f}) 기반 기울기 의심. 글꼴 크기 보정 계수: {font_size_correction_factor:.2f}")
 
-        target_font_size = int(min(render_area_height * 0.9, render_area_width * 0.9 / (len(translated_text.splitlines()[0] if translated_text else 1)*0.5 +1) ) * font_size_correction_factor)
-        target_font_size = max(target_font_size, 1)
+
+        # 초기 목표 폰트 크기 (대략적인 추정)
+        initial_target_font_size = int(min(render_area_height * 0.9, 
+                                    render_area_width * 0.9 / (len(translated_text.splitlines()[0] if translated_text else "A")*0.5 +1) 
+                                   ) * font_size_correction_factor)
+        initial_target_font_size = max(initial_target_font_size, 1) # 최소 1
         
-        min_font_size = 5
-        if target_font_size < min_font_size: target_font_size = min_font_size
+        min_font_size = 5 # 렌더링 가능한 최소 폰트 크기
+        if initial_target_font_size < min_font_size: initial_target_font_size = min_font_size
         
         is_bold_font = '_bold' in font_code_for_render or 'bold' in font_code_for_render.lower()
-        font = self._get_font(target_font_size, lang_code=font_code_for_render, is_bold=is_bold_font)
         
-        final_font_size = target_font_size
-        wrapped_lines = []
-        line_spacing_render = int(target_font_size * 0.2)
+        best_fit_size = min_font_size
+        best_wrapped_lines: List[str] = []
+        best_text_width = 0
+        best_text_height = 0
 
-        while final_font_size >= min_font_size:
-            current_font = self._get_font(final_font_size, lang_code=font_code_for_render, is_bold=is_bold_font)
+        # 이진 탐색으로 최적 폰트 크기 찾기
+        low = min_font_size
+        high = initial_target_font_size
+        
+        # 이진 탐색 중 사용할 line_spacing (초기값은 high 기준)
+        # 실제로는 탐색된 폰트 크기에 따라 동적으로 변해야 함
+        # _calculate_text_dimensions 함수 내부에서 font_size에 맞게 line_spacing 계산하도록 수정
+
+        # 반복 횟수 제한 (무한 루프 방지)
+        max_iterations = int(math.log2(high - low + 1)) + 5 if high > low else 5
+
+
+        current_iteration = 0
+        while low <= high and current_iteration < max_iterations:
+            current_iteration +=1
+            mid_font_size = low + (high - low) // 2
+            if mid_font_size < min_font_size : mid_font_size = min_font_size # 최소 크기 보장
+            if mid_font_size == 0 : break # 폰트 크기가 0이 되면 중단
+
+            current_line_spacing = int(mid_font_size * 0.2) # 현재 폰트 크기에 맞는 줄 간격
+
+            w, h, wrapped = self._calculate_text_dimensions(draw, translated_text, mid_font_size, 
+                                                            render_area_width, font_code_for_render, 
+                                                            is_bold_font, current_line_spacing)
             
-            estimated_chars_per_line = 1
-            if render_area_width > 0:
-                try:
-                    if PILLOW_VERSION_TUPLE >= (9, 2, 0) and hasattr(draw, 'textlength'):
-                        char_w = draw.textlength("W", font=current_font)
-                        if char_w > 0:
-                            estimated_chars_per_line = max(1, int(render_area_width / char_w))
-                    else: 
-                        if hasattr(current_font, 'getlength'):
-                            char_w = current_font.getlength("W")
-                        else: 
-                            char_w = final_font_size * 0.7
-                        if char_w > 0 :
-                            estimated_chars_per_line = max(1, int(render_area_width / char_w))
-                except Exception as e_char_w:
-                    logger.warning(f"한 줄당 문자 수 추정 오류: {e_char_w}. 기본값 사용.")
-                    estimated_chars_per_line = max(1, int(render_area_width / (final_font_size * 0.6)))
-
-            wrapper = textwrap.TextWrapper(width=estimated_chars_per_line, break_long_words=True, 
-                                           replace_whitespace=False, drop_whitespace=False,
-                                           break_on_hyphens=True)
-            temp_wrapped_lines = wrapper.wrap(translated_text)
-            if not temp_wrapped_lines: temp_wrapped_lines = [" "]
-
-            rendered_text_height = 0
-            rendered_text_width = 0
-            if PILLOW_VERSION_TUPLE >= (9, 2, 0) and hasattr(draw, 'multiline_textbbox'):
-                try:
-                    text_bbox = draw.multiline_textbbox((0,0), "\n".join(temp_wrapped_lines), font=current_font, spacing=line_spacing_render)
-                    rendered_text_height = text_bbox[3] - text_bbox[1]
-                    rendered_text_width = text_bbox[2] - text_bbox[0]
-                except Exception as e_mtb:
-                    logger.warning(f"multiline_textbbox 계산 오류: {e_mtb}. 글꼴 크기 조정에 영향 미칠 수 있음.", exc_info=True)
-                    # Fallback or error handling
-                    max_w_line = 0
-                    for line_idx_calc, line_calc in enumerate(temp_wrapped_lines):
-                        line_bbox_calc = current_font.getmask(line_calc).getbbox() if hasattr(current_font.getmask(line_calc),'getbbox') else (0,0,0,final_font_size)
-                        rendered_text_height += (line_bbox_calc[3] - line_bbox_calc[1]) if line_bbox_calc else final_font_size
-                        current_line_width = (line_bbox_calc[2] - line_bbox_calc[0]) if line_bbox_calc else (len(line_calc) * final_font_size * 0.6 if hasattr(current_font, 'getlength') else len(line_calc) * final_font_size * 0.6)
-                        if current_line_width > max_w_line: max_w_line = current_line_width
-                        if line_idx_calc < len(temp_wrapped_lines) - 1:
-                            rendered_text_height += line_spacing_render
-                    rendered_text_width = max_w_line
-
+            if w <= render_area_width and h <= render_area_height:
+                # 현재 크기가 영역에 맞으면, 더 큰 크기를 시도해본다.
+                best_fit_size = mid_font_size
+                best_wrapped_lines = wrapped
+                best_text_width = w
+                best_text_height = h
+                low = mid_font_size + 1
             else:
-                max_w_line = 0
-                for line_idx_calc, line_calc in enumerate(temp_wrapped_lines):
-                    if hasattr(current_font, 'getsize'):
-                        line_w, line_h = current_font.getsize(line_calc)
-                        rendered_text_height += line_h
-                        if line_w > max_w_line: max_w_line = line_w
-                    else:
-                        line_bbox_calc = current_font.getmask(line_calc).getbbox() if hasattr(current_font.getmask(line_calc),'getbbox') else (0,0,0,final_font_size)
-                        rendered_text_height += (line_bbox_calc[3] - line_bbox_calc[1]) if line_bbox_calc else final_font_size
-                        current_line_width = (line_bbox_calc[2] - line_bbox_calc[0]) if line_bbox_calc else len(line_calc) * final_font_size * 0.6
-                        if current_line_width > max_w_line: max_w_line = current_line_width
-                    if line_idx_calc < len(temp_wrapped_lines) - 1:
-                        rendered_text_height += line_spacing_render
-                rendered_text_width = max_w_line
-
-            if rendered_text_height <= render_area_height and rendered_text_width <= render_area_width:
-                wrapped_lines = temp_wrapped_lines
-                logger.debug(f"최종 글꼴 크기: {final_font_size}pt, 줄 수: {len(wrapped_lines)}, 계산된 높이: {rendered_text_height}, 너비: {rendered_text_width}")
-                break
-            
-            final_font_size -= 1
-            line_spacing_render = int(final_font_size * 0.2)
-        else:
-            font = self._get_font(min_font_size, lang_code=font_code_for_render, is_bold=is_bold_font)
-            wrapped_lines = temp_wrapped_lines
-            final_font_size = min_font_size
-            line_spacing_render = int(final_font_size * 0.2)
-            logger.warning(f"텍스트 '{translated_text[:30]}...'가 영역에 맞지 않아 최소 글꼴 크기 {min_font_size}pt로 설정됨. 잘릴 수 있음.")
-
-        text_to_render_final = "\n".join(wrapped_lines)
-        final_text_width = rendered_text_width # Use calculated width from loop
-        final_text_height = rendered_text_height # Use calculated height from loop
-
-        text_x_start = render_area_x_start + (render_area_width - final_text_width) / 2
-        text_y_start = render_area_y_start + (render_area_height - final_text_height) / 2
+                # 현재 크기가 영역에 맞지 않으면, 더 작은 크기를 시도한다.
+                high = mid_font_size - 1
         
-        text_x_start = max(render_area_x_start, text_x_start)
-        text_y_start = max(render_area_y_start, text_y_start)
+        if not best_wrapped_lines: # 이진 탐색으로 적절한 크기를 찾지 못한 경우 (예: 텍스트가 너무 길어 min_font_size로도 안 맞는 경우)
+            # min_font_size로 다시 한 번 계산 시도
+            final_line_spacing = int(min_font_size * 0.2)
+            best_text_width, best_text_height, best_wrapped_lines = self._calculate_text_dimensions(
+                draw, translated_text, min_font_size, render_area_width, font_code_for_render, is_bold_font, final_line_spacing
+            )
+            best_fit_size = min_font_size
+            # logger.warning(f"텍스트 '{translated_text[:30]}...'가 영역에 맞지 않아 최소 글꼴 크기 {min_font_size}pt로 설정됨. 잘릴 수 있음.")
+
+
+        final_font_size = best_fit_size
+        final_font = self._get_font(final_font_size, lang_code=font_code_for_render, is_bold=is_bold_font)
+        final_line_spacing_render = int(final_font_size * 0.2)
+        
+        # 최종 텍스트 위치 계산 (가운데 정렬)
+        text_x_start = render_area_x_start + (render_area_width - best_text_width) / 2
+        text_y_start = render_area_y_start + (render_area_height - best_text_height) / 2
+        
+        text_x_start = max(render_area_x_start, text_x_start) # 영역 벗어나지 않도록
+        text_y_start = max(render_area_y_start, text_y_start) # 영역 벗어나지 않도록
 
         try:
-            if hasattr(draw, 'multiline_text'):
-                draw.multiline_text((text_x_start, text_y_start), 
-                                   text_to_render_final, 
-                                   font=font, 
+            # Pillow 9.0.0 이상에서 multiline_text 지원
+            if PILLOW_VERSION_TUPLE >= (9,0,0) and hasattr(draw, 'multiline_text'):
+                # anchor='lt' (left-top)은 Pillow 9.3.0부터 지원.
+                if PILLOW_VERSION_TUPLE >= (9,3,0):
+                    draw.multiline_text((text_x_start, text_y_start), 
+                                   "\n".join(best_wrapped_lines), 
+                                   font=final_font, 
                                    fill=text_color, 
-                                   spacing=line_spacing_render, 
+                                   spacing=final_line_spacing_render, 
+                                   align="left", anchor="la") # left-ascent anchor
+                else: # anchor 미지원 시 기존 방식
+                     draw.multiline_text((text_x_start, text_y_start), 
+                                   "\n".join(best_wrapped_lines), 
+                                   font=final_font, 
+                                   fill=text_color, 
+                                   spacing=final_line_spacing_render, 
                                    align="left")
-                logger.debug(f"텍스트 렌더링: x={text_x_start:.1f}, y={text_y_start:.1f}, font_size={final_font_size}pt, align=left(block centered)")
-            else:
+                # logger.debug(f"텍스트 렌더링 (이진탐색): x={text_x_start:.1f}, y={text_y_start:.1f}, font_size={final_font_size}pt, align=left(block centered)")
+            else: # 구버전 Pillow (multiline_text 미지원 또는 anchor 미지원)
                  current_y = text_y_start
-                 for line in wrapped_lines:
-                     current_x = text_x_start
-                     draw.text((current_x, current_y), line, font=font, fill=text_color)
-                     line_height_approx = final_font_size + line_spacing_render
-                     current_y += line_height_approx
-                 logger.debug(f"텍스트 렌더링 (구버전 방식): x={text_x_start:.1f}, y_start={text_y_start:.1f}, font_size={final_font_size}pt")
+                 for line_idx, line_txt in enumerate(best_wrapped_lines):
+                     # 각 줄의 너비를 다시 계산하여 가운데 정렬 (multiline_text의 align="center" 효과)
+                     # 여기서는 align="left" 효과를 위해 text_x_start 사용
+                     if hasattr(draw, 'textbbox'):
+                         if PILLOW_VERSION_TUPLE >= (9,3,0):
+                            line_bbox = draw.textbbox((0,0), line_txt, font=final_font, anchor="lt")
+                         else:
+                            line_bbox = draw.textbbox((0,0), line_txt, font=final_font)
+                         line_height = line_bbox[3] - line_bbox[1] if line_bbox else final_font_size
+                     elif hasattr(final_font, 'getsize'):
+                        _, line_height = final_font.getsize(line_txt)
+                     else:
+                        line_height = final_font_size
+
+                     draw.text((text_x_start, current_y), line_txt, font=final_font, fill=text_color)
+                     current_y += line_height + (final_line_spacing_render if line_idx < len(best_wrapped_lines) -1 else 0)
+                 # logger.debug(f"텍스트 렌더링 (구버전, 이진탐색): x={text_x_start:.1f}, y_start={text_y_start:.1f}, font_size={final_font_size}pt")
 
         except Exception as e_draw:
             logger.error(f"텍스트 렌더링 중 오류: {e_draw}", exc_info=True)

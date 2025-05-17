@@ -21,7 +21,8 @@ import shutil
 # 설정 파일 import
 import config
 
-from typing import TYPE_CHECKING, Optional, Dict, Any, List, Tuple, Callable
+from typing import TYPE_CHECKING, Optional, Dict, Any, List, Tuple, Callable, TypedDict # TypedDict 추가
+
 
 if TYPE_CHECKING:
     from translator import OllamaTranslator
@@ -100,6 +101,11 @@ def is_ocr_text_valid(text: str) -> bool:
     logger.debug(f"OCR 유효 (조건 통과): '{stripped_text[:50]}...'")
     return True
 
+class TranslationJob(TypedDict):
+    original_text: str
+    context: Dict[str, Any] # slide_idx, shape_obj_ref, item_type_internal, style_unique_key 등
+    is_ocr: bool
+    char_count: int # 가중치 계산용
 
 class PptxHandler:
     def __init__(self):
@@ -291,15 +297,24 @@ class PptxHandler:
                                       font_code_for_render: str, task_log_filepath: str,
                                       progress_callback_item_completed: Optional[Callable[[Any, str, int, str], None]] = None,
                                       stop_event: Optional[Any] = None,
-                                      image_translation_enabled: bool = True, # 이미지 번역 활성화 여부
-                                      ocr_temperature: Optional[float] = None # OCR 번역 온도
+                                      image_translation_enabled: bool = True,
+                                      ocr_temperature: Optional[float] = None
                                       ) -> bool:
         
         with open(task_log_filepath, 'a', encoding='utf-8') as f_task_log:
             f_task_log.write("--- 1단계: 차트 외 요소 번역 시작 (translate_presentation_stage1) ---\n")
-            logger.info("1단계: 차트 외 요소 (텍스트 상자, 표, OCR 등) 번역 중...")
+            logger.info("1단계: 차트 외 요소 (텍스트 상자, 표, OCR 등) 수집 중...")
 
-            elements_to_process_stage1: List[Dict[str, Any]] = []
+            # 번역할 텍스트와 컨텍스트 정보를 저장할 리스트
+            translation_jobs: List[TranslationJob] = []
+            # OCR 후 이미지 교체를 위한 정보 저장
+            image_update_jobs: List[Dict[str, Any]] = []
+            
+            elements_to_analyze_stage1: List[Dict[str, Any]] = [] # 분석 대상 요소 (UI 업데이트용)
+            original_paragraph_styles_stage1: Dict[Tuple[int, Any, Any], List[Dict[str, Any]]] = {}
+
+
+            # 1단계: 번역 대상 텍스트 및 OCR 작업 수집
             for slide_idx, slide in enumerate(prs.slides):
                 if stop_event and stop_event.is_set(): break
                 for shape_idx, shape in enumerate(slide.shapes):
@@ -307,10 +322,11 @@ class PptxHandler:
                     
                     shape_id = getattr(shape, 'shape_id', f"slide{slide_idx}_shape{shape_idx}")
                     element_name = shape.name or f"S{slide_idx+1}_Shape{shape_idx}_Id{shape_id}"
-                    item_base_info = {'slide_idx': slide_idx, 'shape_obj_ref': shape, 'name': element_name}
-                    item_progress_type = "Unknown" # 진행 콜백용 타입
+                    item_base_info = {'slide_idx': slide_idx, 'shape_obj_ref': shape, 'name': element_name, 'shape_id_log': shape_id}
+                    item_progress_type = "Unknown"
 
                     if shape.shape_type == MSO_SHAPE_TYPE.CHART:
+                        elements_to_analyze_stage1.append({**item_base_info, 'type': 'chart_placeholder', 'char_count':0, 'progress_type': "차트 (2단계 처리)"})
                         continue
 
                     if shape.has_text_frame and hasattr(shape.text_frame, 'text') and \
@@ -319,17 +335,28 @@ class PptxHandler:
                         char_count = 0
                         if not should_skip_translation(original_text):
                             char_count = len(original_text)
+                            style_key_suffix_val = 'shape_text'
+                            style_unique_key = (slide_idx, id(shape), style_key_suffix_val)
+                            translation_jobs.append({
+                                'original_text': original_text,
+                                'context': {**item_base_info, 'item_type_internal': 'text_shape', 'style_unique_key': style_unique_key},
+                                'is_ocr': False,
+                                'char_count': char_count
+                            })
                         item_progress_type = "텍스트"
-                        elements_to_process_stage1.append({**item_base_info, 'type': 'text_shape', # 타입 명확화
-                                                           'original_text': original_text, 'char_count': char_count,
-                                                           'progress_type': item_progress_type})
+                        elements_to_analyze_stage1.append({**item_base_info, 'type': 'text_shape', 'original_text': original_text, 'char_count': char_count, 'progress_type': item_progress_type})
+
                     elif shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
-                        if image_translation_enabled and ocr_handler: # 이미지 번역 옵션 및 핸들러 확인
-                            item_progress_type = "이미지 OCR"
-                            elements_to_process_stage1.append({**item_base_info, 'type': 'image',
-                                                               'progress_type': item_progress_type})
+                        item_progress_type = "이미지 OCR"
+                        elements_to_analyze_stage1.append({**item_base_info, 'type': 'image', 'progress_type': item_progress_type, 'char_count':0}) # char_count는 없지만 가중치 계산 위해 추가
+                        if image_translation_enabled and ocr_handler:
+                            # 이미지 OCR 작업은 바로 처리하지 않고, 아래에서 텍스트 번역과 함께 일괄 처리
+                            # 여기서는 image_update_jobs에 추가하여 나중에 처리할 수 있도록 함
+                            pass # 실제 작업은 아래 텍스트 번역 후 진행
+
                     elif shape.has_table:
                         item_progress_type = "표 내부 텍스트"
+                        elements_to_analyze_stage1.append({**item_base_info, 'type': 'table_container', 'progress_type': item_progress_type, 'char_count':0})
                         for r_idx, row in enumerate(shape.table.rows):
                             for c_idx, cell in enumerate(row.cells):
                                 if hasattr(cell.text_frame, 'text') and cell.text_frame.text and cell.text_frame.text.strip():
@@ -337,355 +364,351 @@ class PptxHandler:
                                     char_count = 0
                                     if not should_skip_translation(original_text):
                                         char_count = len(original_text)
-                                    
-                                    elements_to_process_stage1.append({
-                                        'slide_idx': slide_idx,
-                                        'table_shape_obj_ref': shape,
-                                        'name': f"{element_name}_R{r_idx}C{c_idx}",
-                                        'type': 'table_cell',
-                                        'row_idx': r_idx, 'col_idx': c_idx,
-                                        'original_text': original_text, 'char_count': char_count,
-                                        'progress_type': item_progress_type
-                                    })
+                                        style_key_suffix_val = (r_idx, c_idx)
+                                        style_unique_key = (slide_idx, id(shape), style_key_suffix_val)
+                                        cell_item_name = f"{element_name}_R{r_idx}C{c_idx}"
+                                        translation_jobs.append({
+                                            'original_text': original_text,
+                                            'context': {
+                                                'slide_idx': slide_idx, 'table_shape_obj_ref': shape, 
+                                                'name': cell_item_name, 'item_type_internal': 'table_cell',
+                                                'row_idx': r_idx, 'col_idx': c_idx, 'style_unique_key': style_unique_key,
+                                                'shape_id_log': shape_id 
+                                            },
+                                            'is_ocr': False,
+                                            'char_count': char_count
+                                        })
+                                    # UI 업데이트용 정보도 개별 셀 단위로 추가 가능하나, 여기서는 테이블 단위로 둠
+                                    # elements_to_analyze_stage1.append({'name': cell_item_name, ...})
             
-            f_task_log.write(f"1단계 처리 대상 요소 (차트 제외, 맵핑 완료): {len(elements_to_process_stage1)}개.\n")
-            logger.info(f"1단계 처리 대상 요소 (차트 제외, 맵핑 완료): {len(elements_to_process_stage1)}개.")
+            f_task_log.write(f"1단계 분석 대상 요소 (UI 진행 표시용): {len(elements_to_analyze_stage1)}개.\n")
+            f_task_log.write(f"1단계 번역 작업 수집 완료 (텍스트, 표): {len(translation_jobs)}개 항목.\n")
+            logger.info(f"1단계 번역 작업 수집 완료 (텍스트, 표): {len(translation_jobs)}개 항목.")
 
-            if not elements_to_process_stage1:
+            if not translation_jobs and not (image_translation_enabled and ocr_handler): # OCR도 없으면
                  is_any_chart_present = any(s.shape_type == MSO_SHAPE_TYPE.CHART for slide in prs.slides for s in slide.shapes)
                  if not is_any_chart_present:
-                    msg = "1단계 번역/처리 대상 요소(텍스트/이미지/표)가 없고, 차트도 없어 1단계 처리 스킵."
+                    msg = "1단계 번역/처리 대상 요소(텍스트/표)가 없고, OCR 비활성화 또는 핸들러 부재, 차트도 없어 1단계 처리 스킵."
                     f_task_log.write(msg + "\n")
                     logger.info(msg)
-                 return True # 처리할 내용 없으면 성공으로 간주
+                 return True
 
-            original_paragraph_styles_stage1: Dict[Tuple[int, Any, Any], List[Dict[str, Any]]] = {}
+            # 2단계: 수집된 모든 텍스트 일괄 번역
+            texts_for_batch_translation = [job['original_text'] for job in translation_jobs if job['char_count'] > 0 and not job['is_ocr']]
+            ocr_texts_for_batch_translation = [] # OCR 텍스트는 별도 처리 또는 함께 처리할지 결정
 
-            for item_data in elements_to_process_stage1:
+            translated_texts_batch: List[str] = []
+            if texts_for_batch_translation:
+                f_task_log.write(f"일반 텍스트 {len(texts_for_batch_translation)}개 일괄 번역 시작...\n")
+                logger.info(f"일반 텍스트 {len(texts_for_batch_translation)}개 일괄 번역 시작...")
+                translated_texts_batch = translator.translate_texts_batch(
+                    texts_for_batch_translation, src_lang_ui_name, tgt_lang_ui_name,
+                    model_name, ollama_service, is_ocr_text=False, stop_event=stop_event
+                )
+                f_task_log.write(f"일반 텍스트 일괄 번역 완료. 결과 {len(translated_texts_batch)}개 받음.\n")
+                logger.info(f"일반 텍스트 일괄 번역 완료. 결과 {len(translated_texts_batch)}개 받음.")
+                if len(texts_for_batch_translation) != len(translated_texts_batch):
+                    f_task_log.write(f"경고: 원본 텍스트 수({len(texts_for_batch_translation)})와 번역 결과 수({len(translated_texts_batch)}) 불일치!\n")
+                    logger.warning(f"원본 텍스트 수와 번역 결과 수 불일치! 배치 번역 로직 점검 필요.")
+                    # 불일치 시 안전하게 중단 또는 원본 사용 등의 처리 필요
+                    return False 
+
+
+            # 3단계: 번역된 텍스트를 원본 위치에 적용 및 OCR 처리
+            translated_text_idx = 0
+            for job_idx, job_data in enumerate(translation_jobs):
                 if stop_event and stop_event.is_set():
-                    f_task_log.write(f"1단계 처리 중 중단 요청 감지.\n")
-                    return False # 중단 시 실패 반환
+                    f_task_log.write(f"1단계 적용 중 중단 요청 감지.\n"); return False
 
-                slide_idx = item_data['slide_idx']
-                item_name_log = item_data['name']
-                item_type_internal = item_data['type'] # 내부 로직용 타입 ('text_shape', 'image', 'table_cell')
-                item_progress_type_for_ui = item_data['progress_type'] # UI 표시용 타입
-
-                weighted_work_for_this_item = 0
-                current_text_for_progress_update = item_data.get('original_text', '')[:30] if item_type_internal in ['text_shape', 'table_cell'] else "[이미지 처리]"
+                context = job_data['context']
+                slide_idx = context['slide_idx']
+                item_name_log = context['name']
+                item_type_internal = context['item_type_internal']
+                shape_id_log = context['shape_id_log']
                 
-                current_shape_object = item_data.get('shape_obj_ref') or item_data.get('table_shape_obj_ref')
-                if not current_shape_object:
-                    err_msg_no_ref = f"  오류 (1단계): S{slide_idx+1} ('{item_name_log}') 요소 객체 참조 실패. 건너뜀.\n"
-                    f_task_log.write(err_msg_no_ref)
-                    logger.error(err_msg_no_ref.strip())
-                    if progress_callback_item_completed:
-                        progress_callback_item_completed(slide_idx + 1, "오류", 0, "요소 참조 불가")
-                    continue
-                        
-                shape_id_log = getattr(current_shape_object, 'shape_id', 'N/A_ID')
-                f_task_log.write(f"  [1단계 S{slide_idx+1}] 처리 시작: '{item_name_log}' (ID: {shape_id_log}), 타입: {item_type_internal}\n")
+                current_progress_text = job_data['original_text'][:30]
+                weighted_work_for_item = job_data['char_count'] * config.WEIGHT_TEXT_CHAR
+                
+                f_task_log.write(f"  [1단계 S{slide_idx+1}] 적용 시작: '{item_name_log}' (ID: {shape_id_log}), 타입: {item_type_internal}\n")
 
                 text_frame_for_processing: Optional[Any] = None
-                original_full_text_from_item = item_data.get('original_text', "")
-
                 if item_type_internal == 'text_shape':
-                    if current_shape_object.has_text_frame:
-                        text_frame_for_processing = current_shape_object.text_frame
-                    weighted_work_for_this_item = item_data.get('char_count', 0) * config.WEIGHT_TEXT_CHAR
-
+                    shape_obj = context.get('shape_obj_ref')
+                    if shape_obj and shape_obj.has_text_frame:
+                        text_frame_for_processing = shape_obj.text_frame
                 elif item_type_internal == 'table_cell':
-                    row_idx = item_data['row_idx']
-                    col_idx = item_data['col_idx']
-                    if current_shape_object.has_table:
+                    table_shape_obj = context.get('table_shape_obj_ref')
+                    row_idx, col_idx = context['row_idx'], context['col_idx']
+                    if table_shape_obj and table_shape_obj.has_table:
                         try:
-                            text_frame_for_processing = current_shape_object.table.cell(row_idx, col_idx).text_frame
+                            text_frame_for_processing = table_shape_obj.table.cell(row_idx, col_idx).text_frame
                         except IndexError:
                             err_msg_tbl_idx = f"1단계 테이블 셀 접근 오류 (IndexError): {item_name_log} at R{row_idx}C{col_idx}"
                             logger.error(err_msg_tbl_idx)
                             f_task_log.write(f"    오류: {err_msg_tbl_idx}. 건너뜀.\n")
                             if progress_callback_item_completed:
-                                progress_callback_item_completed(slide_idx + 1, "오류", 0, f"테이블 셀 접근 실패 R{row_idx}C{col_idx}")
-                            continue # 다음 아이템으로
-                    weighted_work_for_this_item = item_data.get('char_count', 0) * config.WEIGHT_TEXT_CHAR
+                                progress_callback_item_completed(slide_idx + 1, "오류", weighted_work_for_item, f"테이블 접근 실패")
+                            continue
                 
-                # 텍스트 프레임 처리 (text_shape, table_cell 공통)
-                if text_frame_for_processing and original_full_text_from_item:
-                    if item_data.get('char_count', 0) == 0 :
-                        f_task_log.write(f"      [1단계 스킵됨 - 번역 불필요 또는 의미 없는 텍스트]\n")
+                if text_frame_for_processing and job_data['char_count'] > 0:
+                    # 스타일 저장 로직 (기존과 유사하게, 하지만 반복적으로 호출되지 않도록 주의)
+                    style_unique_key = context['style_unique_key']
+                    if style_unique_key not in original_paragraph_styles_stage1:
+                        para_styles_collected: List[Dict[str, Any]] = []
+                        # ... (기존 스타일 수집 로직과 동일하게 original_paragraph_styles_stage1[style_unique_key] 채우기) ...
+                        # 이 부분은 최초 수집 단계에서 한 번만 실행되도록 로직 변경이 필요할 수 있음.
+                        # 여기서는 job 생성 시 스타일 키를 만들고, 적용 시 해당 키로 스타일을 가져온다고 가정.
+                        # 만약 스타일 수집이 여기서 처음이라면, 아래처럼 진행:
+                        for para_obj in text_frame_for_processing.paragraphs:
+                            para_default_font_style = self._get_style_properties(para_obj.font)
+                            runs_info: List[Dict[str, Any]] = []
+                            if para_obj.runs:
+                                for run_obj in para_obj.runs:
+                                    runs_info.append({'text': run_obj.text, 'style': self._get_text_style(run_obj)})
+                            elif para_obj.text and para_obj.text.strip():
+                                run_style_from_para = para_default_font_style.copy()
+                                run_style_from_para['hyperlink_address'] = None
+                                runs_info.append({'text': para_obj.text, 'style': run_style_from_para})
+                            
+                            para_styles_collected.append({
+                                'runs': runs_info, 'alignment': para_obj.alignment, 'level': para_obj.level,
+                                'space_before': para_obj.space_before, 'space_after': para_obj.space_after,
+                                'line_spacing': para_obj.line_spacing,
+                                'paragraph_default_run_style': para_default_font_style
+                            })
+                        original_paragraph_styles_stage1[style_unique_key] = para_styles_collected
+                        f_task_log.write(f"      '{item_name_log}'의 원본 단락 스타일 저장 (1단계 적용 시점).\n")
+
+
+                    translated_text_content = translated_texts_batch[translated_text_idx] if translated_text_idx < len(translated_texts_batch) else job_data['original_text']
+                    translated_text_idx +=1
+                    current_progress_text = translated_text_content[:30].replace('\n',' ')
+
+                    log_trans_text_snippet = translated_text_content.replace('\n', ' / ').strip()[:100]
+                    f_task_log.write(f"    [1단계 적용 전] \"{job_data['original_text'].strip()[:50]}...\" -> [1단계 적용 후] \"{log_trans_text_snippet}...\"\n")
+
+                    if "오류:" not in translated_text_content and translated_text_content.strip():
+                        stored_paras_info_apply = original_paragraph_styles_stage1.get(style_unique_key, [])
+                        # ... (기존 텍스트 프레임에 번역된 텍스트와 스타일 적용하는 로직과 동일하게 진행) ...
+                        # 예: text_frame_for_processing.clear(), add_paragraph(), add_run(), 스타일 적용 등
+                        original_tf_auto_sz = getattr(text_frame_for_processing, 'auto_size', None)
+                        original_tf_word_wrp = getattr(text_frame_for_processing, 'word_wrap', None)
+                        original_tf_v_anchor = getattr(text_frame_for_processing, 'vertical_anchor', None)
+                        original_tf_margins = {
+                            'left': getattr(text_frame_for_processing, 'margin_left', None),
+                            'right': getattr(text_frame_for_processing, 'margin_right', None),
+                            'top': getattr(text_frame_for_processing, 'margin_top', None),
+                            'bottom': getattr(text_frame_for_processing, 'margin_bottom', None),
+                        }
+
+                        if original_tf_auto_sz is not None and original_tf_auto_sz != MSO_AUTO_SIZE.NONE:
+                            try: text_frame_for_processing.auto_size = MSO_AUTO_SIZE.NONE
+                            except Exception as e_auto_sz: logger.debug(f"auto_size=NONE 설정 중 예외 (무시): {e_auto_sz}")
+                        if original_tf_word_wrp is not None:
+                            try: text_frame_for_processing.word_wrap = True
+                            except Exception as e_ww: logger.debug(f"word_wrap=True 설정 중 예외 (무시): {e_ww}")
+
+
+                        text_frame_for_processing.clear()
+                        if hasattr(text_frame_for_processing, '_element') and text_frame_for_processing._element is not None:
+                            txBody_xml = text_frame_for_processing._element
+                            p_tags_to_remove = [child for child in txBody_xml if child.tag.endswith('}p')]
+                            if p_tags_to_remove:
+                                for p_xml_tag in p_tags_to_remove: txBody_xml.remove(p_xml_tag)
+                        
+                        lines_from_translation = translated_text_content.splitlines()
+                        if not lines_from_translation and translated_text_content:
+                            lines_from_translation = [translated_text_content]
+                        elif not lines_from_translation:
+                            lines_from_translation = [" "]
+
+                        for line_idx, line_txt in enumerate(lines_from_translation):
+                            new_para = text_frame_for_processing.add_paragraph()
+                            para_style_template = stored_paras_info_apply[min(line_idx, len(stored_paras_info_apply)-1)] if stored_paras_info_apply else {}
+                            
+                            if para_style_template.get('alignment') is not None: new_para.alignment = para_style_template['alignment']
+                            else: new_para.alignment = PP_ALIGN.LEFT
+
+                            new_para.level = para_style_template.get('level', 0)
+                            if para_style_template.get('space_before') is not None: new_para.space_before = para_style_template['space_before']
+                            if para_style_template.get('space_after') is not None: new_para.space_after = para_style_template['space_after']
+                            if para_style_template.get('line_spacing') is not None: new_para.line_spacing = para_style_template['line_spacing']
+                            
+                            if 'paragraph_default_run_style' in para_style_template:
+                                self._apply_style_properties(new_para.font, para_style_template['paragraph_default_run_style'])
+
+                            new_run = new_para.add_run()
+                            new_run.text = line_txt if line_txt.strip() else " "
+                            if not new_run.text.strip() and new_run.text != " ": new_run.text = " "
+
+                            run_style_to_apply = {}
+                            if para_style_template.get('runs') and para_style_template['runs']:
+                                run_style_to_apply = para_style_template['runs'][0]['style']
+                            elif 'paragraph_default_run_style' in para_style_template:
+                                run_style_to_apply = para_style_template['paragraph_default_run_style'].copy()
+                                run_style_to_apply['hyperlink_address'] = None
+
+                            if run_style_to_apply:
+                                self._apply_text_style(new_run, run_style_to_apply)
+                        
+                        if original_tf_auto_sz is not None:
+                            try: text_frame_for_processing.auto_size = original_tf_auto_sz
+                            except Exception as e_auto_sz2: logger.debug(f"auto_size 복원 중 예외 (무시): {e_auto_sz2}")
+                        if original_tf_word_wrp is not None:
+                            try: text_frame_for_processing.word_wrap = original_tf_word_wrp
+                            except Exception as e_ww2: logger.debug(f"word_wrap 복원 중 예외 (무시): {e_ww2}")
+
+                        if original_tf_v_anchor is not None:
+                            try: text_frame_for_processing.vertical_anchor = original_tf_v_anchor
+                            except Exception as e_va: logger.debug(f"vertical_anchor 복원 중 예외 (무시): {e_va}")
+                        for margin_prop, val in original_tf_margins.items():
+                            if val is not None:
+                                try: setattr(text_frame_for_processing, f"margin_{margin_prop}", val)
+                                except Exception as e_margin: logger.debug(f"margin_{margin_prop} 복원 중 예외 (무시): {e_margin}")
+
+                        f_task_log.write(f"        '{item_name_log}' 1단계 번역된 텍스트 적용 완료.\n")
                     else:
-                        f_task_log.write(f"    1단계 번역 대상 텍스트 발견 (길이: {item_data.get('char_count',0)}): \"{original_full_text_from_item.strip()[:50]}...\"\n")
-                        
-                        style_key_suffix_val = (item_data.get('row_idx', -1), item_data.get('col_idx', -1)) if item_type_internal == 'table_cell' else 'shape_text'
-                        style_unique_key = (slide_idx, id(current_shape_object), style_key_suffix_val)
-
-                        if style_unique_key not in original_paragraph_styles_stage1:
-                            para_styles_collected: List[Dict[str, Any]] = []
-                            for para_obj in text_frame_for_processing.paragraphs:
-                                para_default_font_style = self._get_style_properties(para_obj.font)
-                                runs_info: List[Dict[str, Any]] = []
-                                if para_obj.runs:
-                                    for run_obj in para_obj.runs:
-                                        runs_info.append({'text': run_obj.text, 'style': self._get_text_style(run_obj)})
-                                elif para_obj.text and para_obj.text.strip():
-                                    # Run이 없는 단락의 경우, 단락 스타일을 run 스타일로 간주
-                                    run_style_from_para = para_default_font_style.copy()
-                                    run_style_from_para['hyperlink_address'] = None # 단락에는 하이퍼링크 직접 설정 안됨
-                                    runs_info.append({'text': para_obj.text, 'style': run_style_from_para})
-                                
-                                para_styles_collected.append({
-                                    'runs': runs_info,
-                                    'alignment': para_obj.alignment,
-                                    'level': para_obj.level,
-                                    'space_before': para_obj.space_before,
-                                    'space_after': para_obj.space_after,
-                                    'line_spacing': para_obj.line_spacing,
-                                    'paragraph_default_run_style': para_default_font_style
-                                })
-                            original_paragraph_styles_stage1[style_unique_key] = para_styles_collected
-                            f_task_log.write(f"      '{item_name_log}'의 원본 단락 스타일 저장 (1단계).\n")
-                        
-                        translated_text_content = translator.translate_text(
-                            original_full_text_from_item, src_lang_ui_name, tgt_lang_ui_name,
-                            model_name, ollama_service, is_ocr_text=False # 일반 텍스트이므로 is_ocr_text=False
-                        )
-                        log_trans_text_snippet = translated_text_content.replace('\n', ' / ').strip()[:100]
-                        f_task_log.write(f"      [1단계 번역 전] \"{original_full_text_from_item.strip()[:50]}...\" -> [1단계 번역 후] \"{log_trans_text_snippet}...\"\n")
-
-                        if "오류:" not in translated_text_content and translated_text_content.strip():
-                            stored_paras_info_apply = original_paragraph_styles_stage1.get(style_unique_key, [])
-                            
-                            # 텍스트 프레임의 기존 속성 저장
-                            original_tf_auto_sz = getattr(text_frame_for_processing, 'auto_size', None)
-                            original_tf_word_wrp = getattr(text_frame_for_processing, 'word_wrap', None)
-                            original_tf_v_anchor = getattr(text_frame_for_processing, 'vertical_anchor', None)
-                            original_tf_margins = {
-                                'left': getattr(text_frame_for_processing, 'margin_left', None),
-                                'right': getattr(text_frame_for_processing, 'margin_right', None),
-                                'top': getattr(text_frame_for_processing, 'margin_top', None),
-                                'bottom': getattr(text_frame_for_processing, 'margin_bottom', None),
-                            }
-
-                            # 자동 크기 조정을 임시로 비활성화 (텍스트 삽입 중 크기 변경 방지)
-                            if original_tf_auto_sz is not None and original_tf_auto_sz != MSO_AUTO_SIZE.NONE:
-                                text_frame_for_processing.auto_size = MSO_AUTO_SIZE.NONE
-                            if original_tf_word_wrp is not None: text_frame_for_processing.word_wrap = True # 자동 줄 바꿈 활성화
-
-                            text_frame_for_processing.clear() # 기존 텍스트 및 단락 모두 삭제
-                            # clear() 후에도 _element에 <a:p> 태그가 남아있을 수 있으므로 한 번 더 확인
-                            if hasattr(text_frame_for_processing, '_element') and text_frame_for_processing._element is not None:
-                                txBody_xml = text_frame_for_processing._element
-                                p_tags_to_remove = [child for child in txBody_xml if child.tag.endswith('}p')]
-                                if p_tags_to_remove:
-                                    f_task_log.write(f"        (강화된 정리) XML에서 기존 단락 {len(p_tags_to_remove)}개 제거.\n")
-                                    for p_xml_tag in p_tags_to_remove: txBody_xml.remove(p_xml_tag)
-                            
-                            lines_from_translation = translated_text_content.splitlines()
-                            if not lines_from_translation and translated_text_content: # 번역 결과가 있지만 splitlines가 빈 리스트 반환 시
-                                lines_from_translation = [translated_text_content]
-                            elif not lines_from_translation: # 빈 번역 결과
-                                lines_from_translation = [" "] # 빈 단락이라도 하나 만듦 (스타일 유지를 위해)
-
-                            for line_idx, line_txt in enumerate(lines_from_translation):
-                                new_para = text_frame_for_processing.add_paragraph()
-                                # 원본 단락 스타일 적용 (가장 유사한 원본 단락 스타일 사용)
-                                para_style_template = stored_paras_info_apply[min(line_idx, len(stored_paras_info_apply)-1)] if stored_paras_info_apply else {}
-                                
-                                if para_style_template.get('alignment') is not None: new_para.alignment = para_style_template['alignment']
-                                else: new_para.alignment = PP_ALIGN.LEFT # 기본값
-
-                                new_para.level = para_style_template.get('level', 0)
-                                if para_style_template.get('space_before') is not None: new_para.space_before = para_style_template['space_before']
-                                if para_style_template.get('space_after') is not None: new_para.space_after = para_style_template['space_after']
-                                if para_style_template.get('line_spacing') is not None: new_para.line_spacing = para_style_template['line_spacing']
-                                
-                                # 단락 기본 폰트 스타일 적용
-                                if 'paragraph_default_run_style' in para_style_template:
-                                    self._apply_style_properties(new_para.font, para_style_template['paragraph_default_run_style'])
-
-                                # Run 추가 및 스타일 적용
-                                # 원본에 여러 run이 있었다면, 첫 번째 run의 스타일을 대표로 사용하거나,
-                                # 번역된 텍스트 전체를 하나의 run으로 처리하고 대표 스타일 적용.
-                                # 여기서는 하나의 run으로 처리하고, 원본 첫 run 또는 단락 기본 스타일 적용.
-                                new_run = new_para.add_run()
-                                new_run.text = line_txt if line_txt.strip() else " " # 빈 줄은 공백 하나로
-                                if not new_run.text.strip() and new_run.text != " ": new_run.text = " " # 정말 빈 텍스트면 공백
-
-                                run_style_to_apply = {}
-                                if para_style_template.get('runs') and para_style_template['runs']:
-                                    run_style_to_apply = para_style_template['runs'][0]['style'] # 첫 번째 run 스타일 대표 사용
-                                elif 'paragraph_default_run_style' in para_style_template: # run 정보 없으면 단락 기본 사용
-                                    run_style_to_apply = para_style_template['paragraph_default_run_style'].copy()
-                                    run_style_to_apply['hyperlink_address'] = None # 단락 스타일에는 하이퍼링크 없음
-
-                                if run_style_to_apply:
-                                    self._apply_text_style(new_run, run_style_to_apply)
-                            
-                            # 텍스트 프레임 원본 속성 복원
-                            if original_tf_auto_sz is not None: text_frame_for_processing.auto_size = original_tf_auto_sz
-                            if original_tf_word_wrp is not None: text_frame_for_processing.word_wrap = original_tf_word_wrp
-                            if original_tf_v_anchor is not None: text_frame_for_processing.vertical_anchor = original_tf_v_anchor
-                            for margin_prop, val in original_tf_margins.items():
-                                if val is not None: setattr(text_frame_for_processing, f"margin_{margin_prop}", val)
-
-                            f_task_log.write(f"        '{item_name_log}' 1단계 번역된 텍스트 적용 완료.\n")
-                        else:
-                            f_task_log.write(f"      -> 1단계 텍스트 번역 실패 또는 빈 결과: {translated_text_content}\n")
+                        f_task_log.write(f"      -> 1단계 텍스트 번역 실패 또는 빈 결과: {translated_text_content}\n")
                 
-                elif item_type_internal == 'image' and image_translation_enabled and ocr_handler:
-                    weighted_work_for_this_item = config.WEIGHT_IMAGE
-                    f_task_log.write(f"    1단계 OCR 처리 시도: '{item_name_log}' (가중치: {weighted_work_for_this_item})\n")
-                    current_text_for_progress_update = "[이미지 OCR 처리 중]"
-                    # item_progress_type_for_ui는 이미 "이미지 OCR"로 설정됨
+                elif job_data['char_count'] == 0 and item_type_internal in ['text_shape', 'table_cell']: # 번역 스킵 대상
+                     f_task_log.write(f"      [1단계 스킵됨 - 번역 불필요 또는 의미 없는 텍스트]\n")
+                     # weighted_work_for_item 은 이미 0으로 설정되었을 것임 (job 생성 시 char_count 기반)
+                
+                if progress_callback_item_completed and not (stop_event and stop_event.is_set()):
+                    progress_callback_item_completed(slide_idx + 1, "텍스트/표 적용", weighted_work_for_item, current_progress_text)
+                f_task_log.write("\n")
+
+            # 4단계: OCR 작업 처리 (이미지 번역 및 교체)
+            # OCR 작업은 텍스트 번역과 분리하여 처리하거나, 또는 모든 텍스트(일반+OCR)를 한 번에 모아서 배치 번역할 수도 있음.
+            # 여기서는 텍스트 번역 후 순차적으로 OCR 처리 (OCR 결과도 배치 번역에 포함시키려면 구조 변경 필요)
+            if image_translation_enabled and ocr_handler:
+                for slide_idx, slide in enumerate(prs.slides):
+                    if stop_event and stop_event.is_set(): break
+                    # 이미지 shape만 다시 찾아서 처리 (순서 문제 및 객체 참조 문제 피하기 위해)
+                    # 주의: shapes 리스트는 add_picture 등으로 변경될 수 있으므로, 복사본을 사용하거나 인덱스 대신 shape_id 등으로 식별 필요
                     
-                    if current_shape_object is None or not hasattr(current_shape_object, 'image') or \
-                       not hasattr(current_shape_object.image, 'blob'):
-                        warn_msg_no_blob = f"      경고 (1단계): '{item_name_log}' 이미지 객체 또는 blob 데이터 접근 불가. 건너뜀.\n"
-                        f_task_log.write(warn_msg_no_blob)
-                        logger.warning(warn_msg_no_blob.strip())
-                        if progress_callback_item_completed: # 오류 상황도 콜백으로 알림
-                            progress_callback_item_completed(slide_idx + 1, "오류", weighted_work_for_this_item, "이미지 데이터 접근 불가")
-                        continue # 다음 아이템으로
-                    else:
+                    # shapes 리스트는 반복 중 수정될 수 있으므로, 처리할 shape 목록을 미리 만듦
+                    shapes_to_process_for_ocr = [s for s in slide.shapes if s.shape_type == MSO_SHAPE_TYPE.PICTURE]
+
+                    for shape_obj_ocr in shapes_to_process_for_ocr: # 미리 만들어둔 리스트 사용
+                        if stop_event and stop_event.is_set(): break
+                        
+                        shape_id_ocr = getattr(shape_obj_ocr, 'shape_id', f"slide{slide_idx}_shape_ocr_{id(shape_obj_ocr)}")
+                        item_name_ocr = shape_obj_ocr.name or f"S{slide_idx+1}_ImgOCR_Id{shape_id_ocr}"
+                        
+                        f_task_log.write(f"  [1단계 S{slide_idx+1}] OCR 처리 시도: '{item_name_ocr}'\n")
+                        weighted_work_for_ocr_item = config.WEIGHT_IMAGE
+                        current_ocr_progress_text = "[이미지 OCR 처리 중]"
+
                         try:
-                            img_bytes_io = io.BytesIO(current_shape_object.image.blob)
+                            img_bytes_io = io.BytesIO(shape_obj_ocr.image.blob)
                             with Image.open(img_bytes_io) as img_pil_original_ocr:
                                 img_pil_rgb_ocr = img_pil_original_ocr.convert("RGB")
-                                
-                                try: # 이미지 해시 로깅 (디버깅용)
-                                    hasher_md5 = hashlib.md5()
-                                    img_byte_arr_for_hashing = io.BytesIO()
-                                    img_pil_rgb_ocr.save(img_byte_arr_for_hashing, format='PNG')
-                                    hasher_md5.update(img_byte_arr_for_hashing.getvalue())
-                                    img_hash_val_log = hasher_md5.hexdigest()
-                                    f_task_log.write(f"      OCR 대상 RGB 이미지 MD5 해시: {img_hash_val_log}\n")
-                                except Exception as e_hash: logger.debug(f"이미지 해시 생성 중 오류: {e_hash}")
-
                                 ocr_results_list = ocr_handler.ocr_image(img_pil_rgb_ocr)
                                 
                                 if ocr_results_list:
                                     f_task_log.write(f"        이미지 내 OCR 텍스트 {len(ocr_results_list)}개 블록 발견.\n")
-                                    img_bytes_io.seek(0) # BytesIO 재사용을 위해 포인터 처음으로
-                                    with Image.open(img_bytes_io) as img_to_render_on_base:
-                                        original_img_format = img_to_render_on_base.format
-                                        edited_img_pil = img_to_render_on_base.copy() # 복사본에 렌더링
+                                    
+                                    ocr_texts_to_translate_current_image = []
+                                    ocr_job_contexts_current_image = []
+
+                                    for ocr_res_item in ocr_results_list:
+                                        if not (isinstance(ocr_res_item, (list, tuple)) and len(ocr_res_item) >= 2): continue
+                                        ocr_box_coords, ocr_text_conf_pair = ocr_res_item[0], ocr_res_item[1]
+                                        ocr_angle_info = ocr_res_item[2] if len(ocr_res_item) > 2 else None
+                                        if not (isinstance(ocr_text_conf_pair, (list, tuple)) and len(ocr_text_conf_pair) == 2): continue
+                                        ocr_text_original, ocr_confidence = ocr_text_conf_pair
                                         
-                                        any_ocr_text_rendered = False
-                                        for ocr_idx, ocr_res_item in enumerate(ocr_results_list):
-                                            if stop_event and stop_event.is_set(): break
-                                            if not (isinstance(ocr_res_item, (list, tuple)) and len(ocr_res_item) >= 2):
-                                                f_task_log.write(f"          잘못된 형식의 OCR 결과 항목 ({ocr_idx+1}). 건너뜀.\n"); continue
-                                            
-                                            ocr_box_coords = ocr_res_item[0]
-                                            ocr_text_conf_pair = ocr_res_item[1]
-                                            ocr_angle_info = ocr_res_item[2] if len(ocr_res_item) > 2 else None
-
-                                            if not (isinstance(ocr_text_conf_pair, (list, tuple)) and len(ocr_text_conf_pair) == 2):
-                                                f_task_log.write(f"          잘못된 형식의 OCR 텍스트/신뢰도 쌍 ({ocr_idx+1}). 건너뜀.\n"); continue
-                                            
-                                            ocr_text_original, ocr_confidence = ocr_text_conf_pair
-                                            current_text_for_progress_update = ocr_text_original # UI 업데이트용
-                                            item_progress_type_for_ui = "이미지 텍스트 번역" # 더 구체적으로
-
-                                            f_task_log.write(f"          OCR Text [{ocr_idx+1}]: \"{ocr_text_original.strip()[:30]}...\" (신뢰도: {ocr_confidence:.2f}, 각도: {ocr_angle_info})\n")
-
-                                            if not is_ocr_text_valid(ocr_text_original):
-                                                f_task_log.write(f"            -> [스킵됨 - OCR 유효성 낮음]\n"); continue
-                                            if should_skip_translation(ocr_text_original): # 번역 스킵 조건도 확인
-                                                f_task_log.write(f"            -> [스킵됨 - 번역 불필요]\n"); continue
-                                            
-                                            translated_ocr_text_val = translator.translate_text(
-                                                ocr_text_original, src_lang_ui_name, tgt_lang_ui_name,
-                                                model_name, ollama_service,
-                                                is_ocr_text=True, ocr_temperature=ocr_temperature # OCR 온도 전달
-                                            )
-                                            f_task_log.write(f"            -> 번역 결과: \"{translated_ocr_text_val.strip()[:30]}...\"\n")
-
-                                            if "오류:" not in translated_ocr_text_val and translated_ocr_text_val.strip():
-                                                try:
-                                                    # 렌더링 시에도 UI 업데이트 콜백 호출 가능 (세부 진행 표시)
-                                                    # progress_callback_item_completed(slide_idx + 1, "이미지 텍스트 렌더링", 0, translated_ocr_text_val[:20])
-                                                    
-                                                    edited_img_pil = ocr_handler.render_translated_text_on_image(
-                                                        edited_img_pil, ocr_box_coords, translated_ocr_text_val,
-                                                        font_code_for_render=font_code_for_render,
-                                                        original_text=ocr_text_original, ocr_angle=ocr_angle_info
-                                                    )
-                                                    any_ocr_text_rendered = True
-                                                    f_task_log.write(f"              -> 렌더링 완료.\n")
-                                                except Exception as e_render:
-                                                    f_task_log.write(f"              오류: OCR 텍스트 렌더링 실패: {e_render}\n")
-                                                    logger.error(f"OCR 텍스트 렌더링 실패 ('{item_name_log}'): {e_render}", exc_info=True)
-                                            else:
-                                                f_task_log.write(f"            -> 번역 실패 또는 빈 결과로 렌더링 안 함.\n")
-                                        
-                                        if stop_event and stop_event.is_set(): break # OCR 블록 루프 중단 시
-
-                                        if any_ocr_text_rendered: # 렌더링된 내용이 있을 때만 이미지 교체
-                                            output_img_stream = io.BytesIO()
-                                            save_format_ocr_img = original_img_format if original_img_format and original_img_format.upper() in ['JPEG', 'PNG', 'GIF', 'BMP', 'TIFF'] else 'PNG'
-                                            edited_img_pil.save(output_img_stream, format=save_format_ocr_img)
-                                            output_img_stream.seek(0)
-
-                                            # 이미지 교체 로직 (기존 shape_id 유지 시도)
-                                            # 기존 이미지 shape의 위치, 크기, 이름 등 속성 저장
-                                            left, top, width, height = current_shape_object.left, current_shape_object.top, current_shape_object.width, current_shape_object.height
-                                            name = current_shape_object.name
-                                            
-                                            # 기존 이미지 shape 제거
-                                            sp_xml_elem = current_shape_object.element
-                                            parent_xml_elem = sp_xml_elem.getparent()
-                                            if parent_xml_elem is not None:
-                                                parent_xml_elem.remove(sp_xml_elem)
-                                            
-                                                # 새 이미지 추가 (동일 슬라이드에)
-                                                new_pic_shape = prs.slides[slide_idx].shapes.add_picture(
-                                                    output_img_stream, left, top, width=width, height=height
-                                                )
-                                                if name: new_pic_shape.name = name # 이름 복원
-                                                f_task_log.write(f"        이미지 '{item_name_log}' 성공적으로 교체됨.\n")
-                                            else:
-                                                f_task_log.write(f"        경고: 이미지 '{item_name_log}'의 부모 XML 요소 찾지 못해 교체 실패. 원본 유지.\n")
+                                        if is_ocr_text_valid(ocr_text_original) and not should_skip_translation(ocr_text_original):
+                                            ocr_texts_to_translate_current_image.append(ocr_text_original)
+                                            ocr_job_contexts_current_image.append({
+                                                'box': ocr_box_coords, 'original_text': ocr_text_original, 
+                                                'angle': ocr_angle_info, 'confidence': ocr_confidence
+                                            })
                                         else:
-                                            f_task_log.write(f"        이미지 '{item_name_log}'에 번역 및 렌더링된 텍스트가 없어 변경 없음.\n")
+                                            f_task_log.write(f"          OCR Text 스킵됨 (유효성/번역 불필요): \"{ocr_text_original.strip()[:30]}...\"\n")
+
+                                    if ocr_texts_to_translate_current_image:
+                                        f_task_log.write(f"        이미지 내 유효 OCR 텍스트 {len(ocr_texts_to_translate_current_image)}개 배치 번역 시작...\n")
+                                        translated_ocr_texts_batch = translator.translate_texts_batch(
+                                            ocr_texts_to_translate_current_image, src_lang_ui_name, tgt_lang_ui_name,
+                                            model_name, ollama_service, is_ocr_text=True, ocr_temperature=ocr_temperature,
+                                            stop_event=stop_event
+                                        )
+                                        f_task_log.write(f"        이미지 내 OCR 텍스트 배치 번역 완료. 결과 {len(translated_ocr_texts_batch)}개 받음.\n")
+
+                                        if len(ocr_texts_to_translate_current_image) == len(translated_ocr_texts_batch):
+                                            img_bytes_io.seek(0) # 이미지 재사용 위해 포인터 초기화
+                                            with Image.open(img_bytes_io) as img_to_render_on_base:
+                                                original_img_format = img_to_render_on_base.format
+                                                edited_img_pil = img_to_render_on_base.copy()
+                                                any_ocr_text_rendered = False
+
+                                                for i, translated_ocr_text_val in enumerate(translated_ocr_texts_batch):
+                                                    if stop_event and stop_event.is_set(): break
+                                                    ocr_job_ctx = ocr_job_contexts_current_image[i]
+                                                    current_ocr_progress_text = translated_ocr_text_val[:20].replace('\n',' ')
+
+                                                    f_task_log.write(f"          OCR Text [{i+1}]: \"{ocr_job_ctx['original_text'].strip()[:30]}...\" -> 번역: \"{translated_ocr_text_val.strip()[:30]}...\"\n")
+                                                    if "오류:" not in translated_ocr_text_val and translated_ocr_text_val.strip():
+                                                        try:
+                                                            edited_img_pil = ocr_handler.render_translated_text_on_image(
+                                                                edited_img_pil, ocr_job_ctx['box'], translated_ocr_text_val,
+                                                                font_code_for_render=font_code_for_render,
+                                                                original_text=ocr_job_ctx['original_text'], ocr_angle=ocr_job_ctx['angle']
+                                                            )
+                                                            any_ocr_text_rendered = True
+                                                            f_task_log.write(f"              -> 렌더링 완료.\n")
+                                                        except Exception as e_render:
+                                                            f_task_log.write(f"              오류: OCR 텍스트 렌더링 실패: {e_render}\n")
+                                                            logger.error(f"OCR 텍스트 렌더링 실패 ('{item_name_ocr}'): {e_render}", exc_info=True)
+                                                    else:
+                                                        f_task_log.write(f"            -> 번역 실패 또는 빈 결과로 렌더링 안 함.\n")
+                                                
+                                                if stop_event and stop_event.is_set(): break # OCR 블록 루프 중단 시
+                                                
+                                                if any_ocr_text_rendered:
+                                                    output_img_stream = io.BytesIO()
+                                                    save_format_ocr_img = original_img_format if original_img_format and original_img_format.upper() in ['JPEG', 'PNG', 'GIF', 'BMP', 'TIFF'] else 'PNG'
+                                                    edited_img_pil.save(output_img_stream, format=save_format_ocr_img)
+                                                    output_img_stream.seek(0)
+
+                                                    left, top, width, height = shape_obj_ocr.left, shape_obj_ocr.top, shape_obj_ocr.width, shape_obj_ocr.height
+                                                    name_orig_img = shape_obj_ocr.name
+                                                    
+                                                    sp_xml_elem = shape_obj_ocr.element
+                                                    parent_xml_elem = sp_xml_elem.getparent()
+                                                    if parent_xml_elem is not None:
+                                                        parent_xml_elem.remove(sp_xml_elem)
+                                                        new_pic_shape = prs.slides[slide_idx].shapes.add_picture(
+                                                            output_img_stream, left, top, width=width, height=height
+                                                        )
+                                                        if name_orig_img: new_pic_shape.name = name_orig_img
+                                                        f_task_log.write(f"        이미지 '{item_name_ocr}' 성공적으로 교체됨.\n")
+                                                    else:
+                                                        f_task_log.write(f"        경고: 이미지 '{item_name_ocr}'의 부모 XML 요소 찾지 못해 교체 실패. 원본 유지.\n")
+                                                else:
+                                                     f_task_log.write(f"        이미지 '{item_name_ocr}'에 번역 및 렌더링된 텍스트가 없어 변경 없음.\n")
+                                        else: # 배치 번역 결과 개수 불일치
+                                             f_task_log.write(f"        경고: 이미지 '{item_name_ocr}'의 OCR 텍스트 수와 번역 결과 수 불일치. 이미지 변경 없음.\n")
+                                    else: # 번역할 OCR 텍스트 없음
+                                        f_task_log.write(f"        이미지 '{item_name_ocr}' 내 번역 대상 유효 OCR 텍스트 없음.\n")
                                 else: # OCR 결과 없음
-                                    f_task_log.write(f"        이미지 '{item_name_log}' 내에서 OCR 텍스트 발견되지 않음.\n")
-                        except FileNotFoundError:
-                            err_msg_fnf = f"      오류 (1단계): '{item_name_log}' 이미지 파일 처리 중 FileNotFoundError. 건너뜀.\n"
-                            f_task_log.write(err_msg_fnf)
-                            logger.error(err_msg_fnf.strip())
-                            if progress_callback_item_completed:
-                                progress_callback_item_completed(slide_idx + 1, "오류", weighted_work_for_this_item, "이미지 파일 접근 불가")
-                        except IOError as e_io_img:
-                            err_msg_io = f"      오류 (1단계): '{item_name_log}' 이미지 처리 중 I/O 오류: {e_io_img}. 건너뜀.\n"
-                            f_task_log.write(err_msg_io)
-                            logger.error(f"I/O error during OCR image processing for '{item_name_log}': {e_io_img}", exc_info=False) # 스택 트레이스는 너무 길 수 있음
-                            if progress_callback_item_completed:
-                                progress_callback_item_completed(slide_idx + 1, "오류", weighted_work_for_this_item, "이미지 I/O 오류")
-                        except Exception as e_ocr_general:
-                            err_msg_ocr_gen = f"      오류 (1단계): '{item_name_log}' 이미지 처리 중 예기치 않은 오류: {e_ocr_general}. 건너뜀.\n"
+                                    f_task_log.write(f"        이미지 '{item_name_ocr}' 내에서 OCR 텍스트 발견되지 않음.\n")
+                        
+                        except Exception as e_ocr_general_img:
+                            err_msg_ocr_gen = f"      오류 (1단계 OCR 처리): '{item_name_ocr}' 이미지 처리 중 예기치 않은 오류: {e_ocr_general_img}. 건너뜀.\n"
                             f_task_log.write(err_msg_ocr_gen)
-                            logger.error(f"Unexpected error processing image OCR for '{item_name_log}': {e_ocr_general}", exc_info=True)
-                            if progress_callback_item_completed:
-                                progress_callback_item_completed(slide_idx + 1, "오류", weighted_work_for_this_item, "이미지 처리 중 알 수 없는 오류")
-                else: # 처리 대상 타입이 아니거나, 이미지 번역이 비활성화된 경우
-                    if item_type_internal not in ['text_shape', 'table_cell', 'image']:
-                         f_task_log.write(f"    '{item_name_log}' (타입: {item_type_internal})은 1단계에서 처리 대상 아님. 건너뜀.\n")
-                    elif item_type_internal == 'image' and not image_translation_enabled:
-                         f_task_log.write(f"    '{item_name_log}' (타입: 이미지) - 이미지 번역 비활성화로 건너뜀.\n")
-                         weighted_work_for_this_item = config.WEIGHT_IMAGE # 작업량은 계산하되, 실제 작업은 안함
-                    elif item_data.get('char_count', 0) == 0 and item_type_internal in ['text_shape', 'table_cell']:
-                         weighted_work_for_this_item = 0 # 번역 안하므로 작업량 0
-                         f_task_log.write(f"    '{item_name_log}' (타입: {item_type_internal}) 빈 텍스트 또는 스킵 대상임. 작업량 0.\n")
+                            logger.error(f"Unexpected error processing image OCR for '{item_name_ocr}': {e_ocr_general_img}", exc_info=True)
+                        
+                        if progress_callback_item_completed and not (stop_event and stop_event.is_set()):
+                            progress_callback_item_completed(slide_idx + 1, "이미지 OCR 완료", weighted_work_for_ocr_item, current_ocr_progress_text)
+                        f_task_log.write("\n")
 
-
-                if progress_callback_item_completed and not (stop_event and stop_event.is_set()):
-                    progress_callback_item_completed(slide_idx + 1, item_progress_type_for_ui, weighted_work_for_this_item, current_text_for_progress_update)
-                f_task_log.write("\n")
 
             if stop_event and stop_event.is_set():
                 f_task_log.write(f"--- 1단계: 차트 외 요소 번역 중단됨 ---\n")
-                return False # 중단 시 실패 반환
+                return False
 
             f_task_log.write(f"--- 1단계: 차트 외 요소 번역 완료 ---\n\n")
-            return True # 모든 요소 처리 완료 시 성공 반환
+            return True

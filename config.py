@@ -83,3 +83,6 @@ MAX_HISTORY_ITEMS = 50 # 번역 히스토리 최대 저장 개수
 DEFAULT_OCR_TEMPERATURE = 0.4
 DEFAULT_IMAGE_TRANSLATION_ENABLED = True
 DEFAULT_OCR_USE_GPU = False
+
+# --- Translator Configuration (for translator.py) ---
+MAX_TRANSLATION_WORKERS = 2

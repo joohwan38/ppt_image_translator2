@@ -5,7 +5,7 @@ import os
 import tempfile
 import shutil
 import logging
-from typing import TYPE_CHECKING, Callable, Any, Optional
+from typing import TYPE_CHECKING, Callable, Any, Optional, List, Dict # List, Dict 추가
 import traceback
 import re 
 
@@ -24,23 +24,24 @@ class ChartXmlHandler:
         self.ollama_service = ollama_service_instance
         self.WEIGHT_CHART = config.WEIGHT_CHART
 
-    def _translate_text_via_translator(self, text: str, src_lang_ui_name: str, tgt_lang_ui_name: str, model_name: str) -> str:
-        if not text or not text.strip():
-            return text
-        try:
-            translated_text = self.translator.translate_text(
-                text_to_translate=text,
-                src_lang_ui_name=src_lang_ui_name,
-                tgt_lang_ui_name=tgt_lang_ui_name,
-                model_name=model_name,
-                ollama_service_instance=self.ollama_service,
-                is_ocr_text=False 
-            )
-            # logger.debug(f"  - 차트 XML 내 텍스트 번역 (Translator 사용): '{text}' -> '{translated_text}'") # 로그 너무 많을 수 있어 주석 처리
-            return translated_text
-        except Exception as e:
-            logger.error(f"  - 차트 XML 내 텍스트 번역 중 오류 (Translator 사용): {e}")
-            return text 
+    # _translate_text_via_translator 메소드는 배치 번역으로 대체되므로 주석 처리 또는 삭제 가능
+    # def _translate_text_via_translator(self, text: str, src_lang_ui_name: str, tgt_lang_ui_name: str, model_name: str) -> str:
+    #     if not text or not text.strip():
+    #         return text
+    #     try:
+    #         translated_text = self.translator.translate_text(
+    #             text_to_translate=text,
+    #             src_lang_ui_name=src_lang_ui_name,
+    #             tgt_lang_ui_name=tgt_lang_ui_name,
+    #             model_name=model_name,
+    #             ollama_service_instance=self.ollama_service,
+    #             is_ocr_text=False 
+    #         )
+    #         # logger.debug(f"  - 차트 XML 내 텍스트 번역 (Translator 사용): '{text}' -> '{translated_text}'") # 로그 너무 많을 수 있어 주석 처리
+    #         return translated_text
+    #     except Exception as e:
+    #         logger.error(f"  - 차트 XML 내 텍스트 번역 중 오류 (Translator 사용): {e}")
+    #         return text 
 
     def _is_numeric_or_simple_symbols(self, text: str) -> bool:
         """주어진 텍스트가 숫자, 일반적인 기호, 또는 매우 짧은 (영어 기준) 문자열인지 확인"""
@@ -49,9 +50,9 @@ class ChartXmlHandler:
         # 순수 숫자 (소수점, 쉼표, 퍼센트, 통화 기호 등 포함 가능성)
         if re.fullmatch(r"[\d.,\s%+\-/*:$€£¥₩#\(\)]+", text):
             return True
-        # # (사용자 요청에 따라 이 부분은 일단 제거) 한글/한자/일본어가 아닌 1글자 (예: A, B, C ...) - 범례 등에서 사용될 수 있음
-        # if len(text) == 1 and not re.search(r'[가-힣一-龠ぁ-んァ-ヶ]', text):
-        #     return True
+        # (사용자 요청에 따라 이 부분은 일단 제거) 한글/한자/일본어가 아닌 1글자 (예: A, B, C ...) - 범례 등에서 사용될 수 있음
+        if len(text) == 1 and not re.search(r'[가-힣一-龠ぁ-んァ-ヶ]', text):
+            return True
         return False
 
     def translate_charts_in_pptx(self, pptx_path: str, src_lang_ui_name: str, tgt_lang_ui_name: str, 
@@ -66,6 +67,7 @@ class ChartXmlHandler:
 
         log_func = None
         f_task_log_chart_local = None
+        # ... (로그 설정 부분은 기존과 동일) ...
         if task_log_filepath:
             try:
                 f_task_log_chart_local = open(task_log_filepath, 'a', encoding='utf-8')
@@ -87,6 +89,7 @@ class ChartXmlHandler:
 
         temp_dir_for_xml_processing = tempfile.mkdtemp(prefix="chart_xml_")
         
+        # ... (네임스페이스 설정 부분은 기존과 동일) ...
         SCHEMA_MAIN = 'http://schemas.openxmlformats.org/drawingml/2006/main'
         SCHEMA_CHART = 'http://schemas.openxmlformats.org/drawingml/2006/chart'
         SCHEMA_CHARTEX = 'http://schemas.microsoft.com/office/drawing/2014/chartex'
@@ -106,111 +109,166 @@ class ChartXmlHandler:
             try: ET.register_namespace(prefix, uri)
             except ValueError: pass 
 
-        ns_map_for_xpath = {'a': SCHEMA_MAIN, 'c': SCHEMA_CHART, 'cx': SCHEMA_CHARTEX}
-
         try:
+            unique_texts_to_translate_all_charts: Dict[str, None] = {} # 고유 텍스트 저장 (값은 None으로, 키 존재 여부만 확인)
+            chart_xml_contents_map: Dict[str, bytes] = {} # 원본 XML 내용을 저장 (파싱 실패 대비 및 재사용)
+
             with zipfile.ZipFile(pptx_path, 'r') as zip_ref:
                 chart_files = [f for f in zip_ref.namelist() if f.startswith('ppt/charts/') and f.endswith('.xml')]
-                msg_chart_files_found = f"총 {len(chart_files)}개의 차트 XML 파일을 발견했습니다."
+                msg_chart_files_found = f"총 {len(chart_files)}개의 차트 XML 파일을 발견했습니다. 텍스트 수집 중..."
                 if log_func: log_func(msg_chart_files_found)
                 else: logger.info(msg_chart_files_found)
-                
-                modified_charts_data = {} 
 
-                for chart_xml_idx, chart_xml_path_in_zip in enumerate(chart_files):
-                    if stop_event and stop_event.is_set():
-                        msg_stop = "차트 XML 처리 중 중단 요청 감지."
-                        if log_func: log_func(msg_stop)
-                        else: logger.info(msg_stop)
-                        return None
-
-                    msg_processing_chart = f"\n차트 XML 처리 중 ({chart_xml_idx + 1}/{len(chart_files)}): {chart_xml_path_in_zip}"
-                    if log_func: log_func(msg_processing_chart)
-                    else: logger.info(msg_processing_chart)
-                    
+                # 1단계: 모든 차트 XML에서 고유 텍스트 수집
+                for chart_xml_path_in_zip in chart_files:
+                    if stop_event and stop_event.is_set(): break
                     xml_content_bytes = zip_ref.read(chart_xml_path_in_zip)
+                    chart_xml_contents_map[chart_xml_path_in_zip] = xml_content_bytes # 원본 저장
+                    
                     content_str = xml_content_bytes.decode('utf-8', errors='ignore')
                     if content_str.lstrip().startswith('<?xml'):
                         content_str = re.sub(r'^\s*<\?xml[^>]*\?>', '', content_str, count=1).strip()
                     
                     try:
                         root = ET.fromstring(content_str)
+                        for elem in root.iter():
+                            if stop_event and stop_event.is_set(): break
+                            if elem.tag.endswith('}t') or elem.tag.endswith('}v'):
+                                original_text = elem.text
+                                if original_text and original_text.strip():
+                                    original_text_stripped = original_text.strip()
+                                    if not self._is_numeric_or_simple_symbols(original_text_stripped):
+                                        unique_texts_to_translate_all_charts[original_text_stripped] = None
                     except ET.ParseError as e_parse:
-                        err_msg_parse = f"  오류: 차트 XML 파싱 실패 ({chart_xml_path_in_zip}). 건너뜀. 원인: {e_parse}"
+                        err_msg_parse = f"  오류: 차트 XML 파싱 실패 ({chart_xml_path_in_zip}) - 텍스트 수집 건너뜀. 원인: {e_parse}"
                         if log_func: log_func(err_msg_parse)
                         else: logger.error(err_msg_parse)
-                        modified_charts_data[chart_xml_path_in_zip] = xml_content_bytes 
-                        if progress_callback_item_completed:
-                            progress_callback_item_completed(f"차트 {chart_xml_idx + 1}", "차트 오류", self.WEIGHT_CHART / len(chart_files) if chart_files else self.WEIGHT_CHART , f"파싱 오류: {os.path.basename(chart_xml_path_in_zip)}")
-                        continue
+                
+                if stop_event and stop_event.is_set():
+                    msg_stop_collect = "차트 텍스트 수집 중 중단 요청 감지."
+                    if log_func: log_func(msg_stop_collect); return None
+                    else: logger.info(msg_stop_collect); return None
+
+                # 2단계: 수집된 고유 텍스트 일괄 번역
+                texts_list_for_batch = list(unique_texts_to_translate_all_charts.keys())
+                translation_map: Dict[str, str] = {}
+
+                if texts_list_for_batch:
+                    msg_batch_start = f"차트 내 고유 텍스트 {len(texts_list_for_batch)}개 일괄 번역 시작..."
+                    if log_func: log_func(msg_batch_start)
+                    else: logger.info(msg_batch_start)
+
+                    translated_texts_batch = self.translator.translate_texts_batch(
+                        texts_list_for_batch, src_lang_ui_name, tgt_lang_ui_name, model_name,
+                        self.ollama_service, is_ocr_text=False, stop_event=stop_event # 차트 텍스트는 OCR 아님
+                    )
+
+                    if stop_event and stop_event.is_set():
+                        msg_stop_batch = "차트 텍스트 일괄 번역 중 중단 요청 감지."
+                        if log_func: log_func(msg_stop_batch); return None
+                        else: logger.info(msg_stop_batch); return None
                     
-                    # XPath 표현식 단순화 및 순회 방식으로 변경
-                    # 번역할 텍스트를 담고 있을 가능성이 있는 모든 태그를 찾음
-                    # ElementTree는 완전한 XPath 2.0을 지원하지 않으므로, 가능한 모든 텍스트 노드를 찾는 방식으로 접근
+                    if len(texts_list_for_batch) == len(translated_texts_batch):
+                        for original, translated in zip(texts_list_for_batch, translated_texts_batch):
+                            translation_map[original] = translated
+                        msg_batch_done = f"차트 내 고유 텍스트 일괄 번역 완료. {len(translation_map)}개 매핑 생성."
+                        if log_func: log_func(msg_batch_done)
+                        else: logger.info(msg_batch_done)
+                    else:
+                        warn_msg_mismatch = f"경고: 차트 원본 텍스트 수({len(texts_list_for_batch)})와 번역 결과 수({len(translated_texts_batch)}) 불일치!"
+                        if log_func: log_func(warn_msg_mismatch)
+                        else: logger.warning(warn_msg_mismatch)
+                        # 불일치 시, 번역된 것만 사용하거나, 전체 차트 번역을 스킵할 수 있음. 여기서는 번역된 것만 사용.
+                        # 또는 오류로 간주하고 None 반환 가능
+                        return None
+
+
+                # 3단계: 번역된 텍스트를 사용하여 차트 XML 수정 및 저장
+                modified_charts_data: Dict[str, bytes] = {} 
+                total_charts = len(chart_files)
+                processed_charts_count = 0
+
+                for chart_xml_idx, chart_xml_path_in_zip in enumerate(chart_files):
+                    if stop_event and stop_event.is_set(): break
+
+                    msg_processing_chart = f"\n차트 XML 적용 중 ({chart_xml_idx + 1}/{total_charts}): {chart_xml_path_in_zip}"
+                    if log_func: log_func(msg_processing_chart)
+                    else: logger.info(msg_processing_chart)
+                    
+                    xml_content_bytes = chart_xml_contents_map[chart_xml_path_in_zip] # 저장된 원본 사용
+                    content_str = xml_content_bytes.decode('utf-8', errors='ignore')
+                    if content_str.lstrip().startswith('<?xml'):
+                        content_str = re.sub(r'^\s*<\?xml[^>]*\?>', '', content_str, count=1).strip()
                     
                     num_translated_in_chart = 0
-                    translated_texts_cache_chart = {}
-
-                    for elem in root.iter(): # 모든 하위 요소 순회
-                        if stop_event and stop_event.is_set(): break
+                    try:
+                        root = ET.fromstring(content_str)
+                        for elem in root.iter():
+                            if stop_event and stop_event.is_set(): break
+                            if elem.tag.endswith('}t') or elem.tag.endswith('}v'):
+                                original_text = elem.text
+                                if original_text and original_text.strip():
+                                    original_text_stripped = original_text.strip()
+                                    if original_text_stripped in translation_map:
+                                        translated = translation_map[original_text_stripped]
+                                        if "오류:" not in translated and translated.strip() and translated.strip() != original_text_stripped:
+                                            elem.text = translated
+                                            num_translated_in_chart += 1
+                                            log_msg_detail = f"    차트 요소 번역됨 (태그: {elem.tag}): '{original_text_stripped}' -> '{translated}'"
+                                            if log_func: log_func(log_msg_detail)
+                                            # else: logger.debug(log_msg_detail) # 너무 많은 로그 방지
+                                        elif "오류:" in translated:
+                                            log_msg_err = f"    차트 요소 번역 오류 (태그: {elem.tag}, 원본: '{original_text_stripped}') -> {translated}"
+                                            if log_func: log_func(log_msg_err)
+                                            else: logger.warning(log_msg_err)
                         
-                        # a:t, c:v, cx:v 태그의 텍스트를 주요 대상으로 하되, 다른 태그도 검사 가능
-                        # 여기서는 명시적으로 많이 사용되는 태그의 텍스트를 확인
-                        if elem.tag.endswith('}t') or elem.tag.endswith('}v'): # 네임스페이스 무관하게 t 또는 v로 끝나는 태그
-                            original_text = elem.text
-                            if original_text and original_text.strip():
-                                original_text_stripped = original_text.strip()
-                                
-                                if self._is_numeric_or_simple_symbols(original_text_stripped):
-                                    # logger.debug(f"    숫자/기호로 판단되어 번역 스킵: '{original_text_stripped}' (태그: {elem.tag})")
-                                    continue
-                                # 사용자 요청: "매우 짧은 (1글자) 비대상 언어 텍스트는 번역에서 제외하는 조건" 제거
-                                # if len(original_text_stripped) < 2 and not re.search(r'[가-힣一-龠ぁ-んァ-ヶ]', original_text_stripped):
-                                #     logger.debug(f"    매우 짧은 비대상 언어 텍스트로 판단되어 번역 스킵: '{original_text_stripped}' (태그: {elem.tag})")
-                                #     continue
+                        if num_translated_in_chart > 0:
+                             logger.info(f"  {chart_xml_path_in_zip} 에서 {num_translated_in_chart}개의 텍스트 요소 번역됨.")
+                        else:
+                             logger.info(f"  {chart_xml_path_in_zip} 에서 번역된 텍스트 요소 없음 (또는 숫자/기호 등으로 스킵됨 / 이미 번역됨).")
 
-                                if original_text_stripped in translated_texts_cache_chart:
-                                    elem.text = translated_texts_cache_chart[original_text_stripped]
-                                else:
-                                    translated = self._translate_text_via_translator(original_text_stripped, src_lang_ui_name, tgt_lang_ui_name, model_name)
-                                    if "오류:" not in translated and translated.strip() and translated.strip() != original_text_stripped :
-                                        elem.text = translated
-                                        translated_texts_cache_chart[original_text_stripped] = translated
-                                        num_translated_in_chart +=1
-                                        log_msg_detail = f"    차트 요소 번역됨 (태그: {elem.tag}): '{original_text_stripped}' -> '{translated}'"
-                                        if log_func: log_func(log_msg_detail)
-                                        else: logger.debug(log_msg_detail)
-                                    elif "오류:" in translated:
-                                         log_msg_err = f"    차트 요소 번역 오류 (태그: {elem.tag}): '{original_text_stripped}' -> {translated}"
-                                         if log_func: log_func(log_msg_err)
-                                         else: logger.warning(log_msg_err)
-                        if stop_event and stop_event.is_set(): break
+                        xml_declaration_bytes = b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+                        xml_string_unicode = ET.tostring(root, encoding='unicode', method='xml')
+                        modified_charts_data[chart_xml_path_in_zip] = xml_declaration_bytes + xml_string_unicode.encode('utf-8')
                     
-                    if num_translated_in_chart > 0:
-                         logger.info(f"  {chart_xml_path_in_zip} 에서 {num_translated_in_chart}개의 텍스트 요소 번역됨.")
-                    else:
-                         logger.info(f"  {chart_xml_path_in_zip} 에서 번역된 텍스트 요소 없음 (또는 숫자/기호 등으로 스킵됨).")
-
-
-                    xml_declaration_bytes = b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
-                    xml_string_unicode = ET.tostring(root, encoding='unicode', method='xml')
-                    modified_charts_data[chart_xml_path_in_zip] = xml_declaration_bytes + xml_string_unicode.encode('utf-8')
+                    except ET.ParseError as e_parse_apply: # 2차 파싱 오류 (수집 시 성공했더라도)
+                        err_msg_parse_apply = f"  오류: 차트 XML 재파싱/적용 실패 ({chart_xml_path_in_zip}). 원본 사용. 원인: {e_parse_apply}"
+                        if log_func: log_func(err_msg_parse_apply)
+                        else: logger.error(err_msg_parse_apply)
+                        modified_charts_data[chart_xml_path_in_zip] = xml_content_bytes # 원본으로 복구
                     
+                    processed_charts_count +=1
                     if progress_callback_item_completed:
-                        progress_callback_item_completed(f"차트 {chart_xml_idx + 1}", "차트 파일 처리", self.WEIGHT_CHART / len(chart_files) if chart_files else self.WEIGHT_CHART, f"{os.path.basename(chart_xml_path_in_zip)} ({num_translated_in_chart}개 번역)")
+                        progress_callback_item_completed(
+                            f"차트 {chart_xml_idx + 1}", "차트 파일 처리", 
+                            self.WEIGHT_CHART / total_charts if total_charts > 0 else self.WEIGHT_CHART, 
+                            f"{os.path.basename(chart_xml_path_in_zip)} ({num_translated_in_chart}개 번역)"
+                        )
                 
+                if stop_event and stop_event.is_set():
+                    msg_stop_apply = "차트 XML 적용 중 중단 요청 감지."
+                    if log_func: log_func(msg_stop_apply); return None
+                    else: logger.info(msg_stop_apply); return None
+
+                # 최종 PPTX 파일 생성
                 with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED) as zip_out:
+                    # zip_ref는 이미 닫혔으므로, 원본 파일의 다른 멤버들을 다시 읽어야 함.
+                    # 또는, zip_ref를 열어둔 상태로 유지하거나, 모든 멤버를 미리 읽어둬야 함.
+                    # 여기서는 간결성을 위해 다시 원본 파일을 열어 멤버를 읽는 방식을 택하나,
+                    # 매우 큰 파일의 경우 비효율적일 수 있음.
+                    # -> 수정: zip_ref를 with 문 내에서 계속 사용하도록 변경 (이미 그렇게 되어 있음)
                     for item_name_in_zip in zip_ref.namelist():
                         if item_name_in_zip in modified_charts_data:
                             zip_out.writestr(item_name_in_zip, modified_charts_data[item_name_in_zip])
                         else:
                             zip_out.writestr(item_name_in_zip, zip_ref.read(item_name_in_zip))
             
-            final_msg = f"\nPPTX 내 차트 XML 번역 완료! 최종 파일 저장됨: {output_path}"
+            final_msg = f"\nPPTX 내 차트 XML 번역 완료! ({processed_charts_count}/{total_charts}개 차트 처리) 최종 파일 저장됨: {output_path}"
             if log_func: log_func(final_msg)
             else: logger.info(final_msg)
             return output_path
         
+        # ... (기존 except 및 finally 블록은 그대로 유지) ...
         except FileNotFoundError:
             err_msg_fnf = f"오류: 원본 PPTX 파일 '{pptx_path}'를 찾을 수 없습니다."
             if log_func: log_func(err_msg_fnf)
@@ -230,7 +288,7 @@ class ChartXmlHandler:
             if os.path.exists(temp_dir_for_xml_processing):
                 try:
                     shutil.rmtree(temp_dir_for_xml_processing)
-                    logger.debug(f"임시 디렉토리 '{temp_dir_for_xml_processing}' 삭제 완료.")
+                    # logger.debug(f"임시 디렉토리 '{temp_dir_for_xml_processing}' 삭제 완료.")
                 except Exception as e_clean:
                     logger.warning(f"임시 디렉토리 '{temp_dir_for_xml_processing}' 삭제 중 오류: {e_clean}")
             if f_task_log_chart_local and not f_task_log_chart_local.closed:

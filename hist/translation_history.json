@@ -8,6 +8,32 @@
         "ocr_gpu": false,
         "img_trans_enabled": true,
         "status": "성공",
+        "time": "2025-05-17 16:11:49",
+        "path": "/Users/user/Documents/my_env/ppt_image_translator2/files/xml_test_일본어_translated.pptx",
+        "log_file": "/Users/user/Documents/my_env/ppt_image_translator2/logs/translation_20250517_160938_xml_test.log"
+    },
+    {
+        "name": "xml_test.pptx",
+        "src": "한국어",
+        "tgt": "일본어",
+        "model": "gemma3:12b",
+        "ocr_temp": 0.4,
+        "ocr_gpu": false,
+        "img_trans_enabled": true,
+        "status": "성공",
+        "time": "2025-05-17 15:50:40",
+        "path": "/Users/user/Documents/my_env/ppt_image_translator2/files/xml_test_일본어_translated.pptx",
+        "log_file": "/Users/user/Documents/my_env/ppt_image_translator2/logs/translation_20250517_154725_xml_test.log"
+    },
+    {
+        "name": "xml_test.pptx",
+        "src": "한국어",
+        "tgt": "일본어",
+        "model": "gemma3:12b",
+        "ocr_temp": 0.4,
+        "ocr_gpu": false,
+        "img_trans_enabled": true,
+        "status": "성공",
         "time": "2025-05-17 15:36:23",
         "path": "/Users/user/Documents/my_env/ppt_image_translator2/files/xml_test_일본어_translated.pptx",
         "log_file": "/Users/user/Documents/my_env/ppt_image_translator2/logs/translation_20250517_153339_xml_test.log"
