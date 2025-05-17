@@ -3,16 +3,17 @@ import os
 import logging
 
 # --- Base Directories ---
-# 이 프로젝트의 루트 디렉터리를 기준으로 합니다.
-# config.py 파일이 프로젝트 루트에 있다고 가정합니다.
+# ... (기존과 동일) ...
 PROJECT_ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # --- Application Settings ---
 APP_NAME = "Powerpoint Document Translator"
 DEFAULT_OLLAMA_MODEL = "gemma3:12b" # Ollama 번역 모델
 SUPPORTED_LANGUAGES = ["한국어", "일본어", "영어", "중국어", "대만어", "태국어", "스페인어"]
+USER_SETTINGS_FILENAME = "user_settings.json" # --- 1단계 개선: 사용자 설정 파일 이름 추가 ---
 
 # --- Path Settings (PROJECT_ROOT_DIR 기준 상대 경로) ---
+# ... (기존과 동일) ...
 ASSETS_DIR_NAME = "assets"
 FONTS_DIR_NAME = "fonts"
 LOGS_DIR_NAME = "logs"
@@ -66,14 +67,8 @@ MODELS_CACHE_TTL_SECONDS = 300 # 모델 목록 API 결과 캐시 시간 (초), �
 
 # --- Translator Configuration (for translator.py) ---
 TRANSLATOR_TEMPERATURE_GENERAL = 0.2 # 텍스트 번역 기본 온도
-# MAX_TRANSLATION_WORKERS 값을 더 넉넉하게 설정 (예: 8 또는 16).
-# 로컬 Ollama 서버의 성능과 사용자 시스템 환경에 따라 조절 필요.
-# 너무 높으면 Ollama 서버에 부담을 주거나 컨텍스트 스위칭 오버헤드 발생 가능.
-# 여기서는 예시로 8로 설정.
 MAX_TRANSLATION_WORKERS = 8
-# OCR 병렬 처리를 위한 워커 수 (번역 워커와 별도로 설정하거나 공유 가능)
-# 여기서는 번역 워커와 동일하게 설정
-MAX_OCR_WORKERS = MAX_TRANSLATION_WORKERS
+MAX_OCR_WORKERS = MAX_TRANSLATION_WORKERS # OCR 작업자 수를 번역 작업자 수와 동일하게 설정 (필요시 분리)
 
 
 # --- PPTX Handler Configuration (for pptx_handler.py) ---
@@ -87,7 +82,9 @@ UI_LANG_TO_FONT_CODE_MAP = {
 }
 MAX_HISTORY_ITEMS = 50 # 번역 히스토리 최대 저장 개수
 
-# --- Advanced Options Defaults ---
-DEFAULT_OCR_TEMPERATURE = 0.4
-DEFAULT_IMAGE_TRANSLATION_ENABLED = True
-DEFAULT_OCR_USE_GPU = False
+# --- Advanced Options Defaults (애플리케이션 기본값, 사용자 설정에 의해 덮어쓰여질 수 있음) ---
+DEFAULT_ADVANCED_SETTINGS = {
+    "ocr_temperature": 0.4,
+    "image_translation_enabled": True,
+    "ocr_use_gpu": False
+}
