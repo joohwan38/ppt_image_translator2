@@ -6,6 +6,7 @@ dist/
 wheels/
 logs/
 assets/
+hist/
 files/
 *.egg-info
 *.pptx
